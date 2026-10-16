@@ -366,17 +366,37 @@ uint32_t WaterRipples::UploadDisturbances(IDirect3DDevice9* dev, WindowShift shi
 }
 
 void WaterRipples::Step(IDirect3DDevice9* dev, const float centre[2], const WaterRippleDisturbance* disturbances,
-                        uint32_t count)
+                        uint32_t count, IDirect3DTexture9* flow, const float* flowMapping)
 {
     if (!m_maps[0] || !m_maps[1] || !m_step)
         return;
     SetStepState(dev);
     const WindowShift shift = Recentre(dev, centre);
     const uint32_t used = UploadDisturbances(dev, shift, disturbances, count);
+    // The current (water_flow.h): the step reads the state from upstream, bilinear (texel centres where it is still).
+    const bool drifting = flow && flowMapping && flowMapping[3] > 0.5f;
+    const float world[8] = {static_cast<float>(m_origin[0] * static_cast<double>(kWaterRippleTexelYards)),
+                            static_cast<float>(m_origin[1] * static_cast<double>(kWaterRippleTexelYards)),
+                            kWaterRippleTexelYards, static_cast<float>(kWaterRippleStepSeconds),
+                            drifting ? flowMapping[0] : 0.0f, drifting ? flowMapping[1] : 0.0f,
+                            drifting ? flowMapping[2] : 0.0f, drifting ? 1.0f : 0.0f};
+    dev->SetPixelShaderConstantF(97, world, 2);
+    if (drifting)
+    {
+        dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+        dev->SetTexture(1, flow);
+        for (const SamplerSetting& setting : kPointClampSampler)
+            dev->SetSamplerState(1, setting.state, setting.value);
+        dev->SetSamplerState(1, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+        dev->SetSamplerState(1, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    }
     SetTarget(dev, m_maps[1 - m_current]);
     dev->SetTexture(0, m_maps[m_current]);
     DrawFullscreenTriangle(dev);
     dev->SetTexture(0, nullptr);
+    if (drifting)
+        dev->SetTexture(1, nullptr);
     m_current = 1 - m_current;
     ++m_stepsRun;
     m_quietSteps = used ? 0 : m_quietSteps + 1;

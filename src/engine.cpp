@@ -72,6 +72,8 @@ constexpr uintptr_t kLightSkyColors[kSkyColorCount] = {0x00D38BE0, 0x00D38BE4, 0
                                                        0x00D38BEC, 0x00D38BF0, 0x00D38BF4};
 constexpr uintptr_t kLightRiverColors[kWaterColorPair] = {0x00D38C14, 0x00D38C18};
 constexpr uintptr_t kLightOceanColors[kWaterColorPair] = {0x00D38C0C, 0x00D38C10};
+// LightParams' waterShallowAlpha / waterDeepAlpha in the same current-light record (0x00D38BD4 + 0x6C / 0x70).
+constexpr uintptr_t kLightWaterAlpha[kWaterColorPair] = {0x00D38C40, 0x00D38C44};
 
 constexpr uintptr_t kLiquidSettingsBankCount = 0x00D43B18;
 constexpr uintptr_t kLiquidSettingsBankEntries = 0x00D43B1C;
@@ -112,6 +114,15 @@ const CodeBytes kLightRecordStores[] = {
     {"ocean far colour store", 0x007EC132, 3, {0x89, 0x4E, 0x3C}},
     {"river close colour store", 0x007EC144, 3, {0x89, 0x46, 0x40}},
     {"river far colour store", 0x007EC152, 3, {0x89, 0x56, 0x44}},
+};
+
+// Where the client fills those two from a LightParams row (fstp [esi+6Ch] / [esi+70h]) and copies its blended
+// record's into the current one (fstp [00D38C40h] / [00D38C44h]).
+const CodeBytes kLightWaterAlphaStores[] = {
+    {"water shallow alpha from params", 0x007EC1D9, 3, {0xD9, 0x5E, 0x6C}},
+    {"water deep alpha from params", 0x007EC1DF, 3, {0xD9, 0x5E, 0x70}},
+    {"current water shallow alpha store", 0x007F34BE, 6, {0xD9, 0x1D, 0x40, 0x8C, 0xD3, 0x00}},
+    {"current water deep alpha store", 0x007F34D0, 6, {0xD9, 0x1D, 0x44, 0x8C, 0xD3, 0x00}},
 };
 
 const CodeBytes kWaterClientLayout[] = {
@@ -466,6 +477,7 @@ enum class LayoutCheck
 };
 
 LayoutCheck g_lightRecordLayout = LayoutCheck::Unchecked;
+LayoutCheck g_waterAlphaLayout = LayoutCheck::Unchecked;
 
 bool LightRecordLayoutMatches()
 {
@@ -473,6 +485,14 @@ bool LightRecordLayoutMatches()
         g_lightRecordLayout = AllCodeBytesMatch(kLightRecordStores, "water light colours") ? LayoutCheck::Matches
                                                                                              : LayoutCheck::Differs;
     return g_lightRecordLayout == LayoutCheck::Matches;
+}
+
+bool WaterAlphaLayoutMatches()
+{
+    if (g_waterAlphaLayout == LayoutCheck::Unchecked)
+        g_waterAlphaLayout = AllCodeBytesMatch(kLightWaterAlphaStores, "water opacity") ? LayoutCheck::Matches
+                                                                                       : LayoutCheck::Differs;
+    return g_waterAlphaLayout == LayoutCheck::Matches;
 }
 
 bool SlotHolds(uintptr_t slot, uintptr_t expected)
@@ -912,10 +932,32 @@ bool BuildFrameInputs(FrameInputs& out, bool withPointLights, const PointLightUp
     }
 }
 
+// The opacity is optional: without it the absorption keeps the preset's brightness.
+void ReadWaterAlpha(WaterInputs& out)
+{
+    __try
+    {
+        for (int i = 0; i < kWaterColorPair; ++i)
+            out.waterAlpha[i] = Read<float>(kLightWaterAlpha[i]);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return;
+    }
+    for (float alpha : out.waterAlpha)
+        if (!std::isfinite(alpha) || alpha < 0.0f || alpha > 1.0f)
+            return;
+    out.waterAlphaValid = true;
+}
+
 bool BuildWaterInputs(WaterInputs& out)
 {
     out = {};
-    return LightRecordLayoutMatches() && ReadWaterColors(out);
+    if (!LightRecordLayoutMatches() || !ReadWaterColors(out))
+        return false;
+    if (WaterAlphaLayoutMatches())
+        ReadWaterAlpha(out);
+    return true;
 }
 
 bool TransparentLiquidsQueued(const void* liquidRenderer)

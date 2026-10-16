@@ -8,6 +8,7 @@
 #include "d3d9_wrap.h"
 #include "hooks.h"
 #include "msaa_depth.h"
+#include "WaterRain.hpp"
 
 #include "wxl/PluginApi.h"
 
@@ -22,7 +23,8 @@ namespace
     const char* const kWaterQualityNames[] = {"Low: 128 waves, sky only", "Medium: 128 waves, scene refl.",
                                               "High: 256 waves, finer refl."};
     const char* const kWaterDebugViewNames[] = {"Off",        "Normals",      "Foam",   "Transmittance",
-                                                "Reflection", "Liquid class", "Ripples"};
+                                                "Reflection", "Liquid class", "Ripples", "Refraction offset",
+                                                "River flow"};
 
     struct PanelEdit
     {
@@ -89,8 +91,21 @@ static void __cdecl DrawPanel(void*)
         p.Float("Clarity", edited.waterClarity, 0.25f, 4.0f);
         p.Float("Zone colours", edited.waterZoneColors, 0.0f, 1.0f);
         p.Float("Ripples", edited.waterRipples, 0.0f, 2.0f);
+        p.Float("Rain ripples", edited.waterRainRipples, 0.0f, 2.0f);
+        p.Float("Rain ring size", edited.waterRainSize, 0.5f, 3.0f);
+        p.Float("Rain ripple distance", edited.waterRainDistance, 24.0f, 160.0f);
+        std::snprintf(line, sizeof(line), "Rain intensity: %.0f%%", water_rain::Intensity() * 100.0f);
+        api.UiText(line);
         p.Check("Client splashes", edited.waterClientSplashes);
-        p.Combo("Water view", edited.waterDebugView, kWaterDebugViewNames, 7);
+        p.Check("Rivers run (the map scan's current)", edited.waterRiverFlow);
+        p.Combo("Water view", edited.waterDebugView, kWaterDebugViewNames, 9);
+    }
+    if (p.Section("Shadows"))
+    {
+        // The client's real-time shadows (Shadow Quality): how far its shadow maps are pushed off the surfaces
+        // they shadow. More removes stripes on walls the light skims; too much lifts shadows off their feet.
+        p.Float("Shadow slope bias", edited.shadowSlopeBias, 0.0f, 8.0f);
+        p.Float("Shadow depth bias", edited.shadowDepthBias, 0.0f, 0.002f);
     }
     if (p.Section("Antialiasing"))
         p.Check("Keep the game's multisampling", edited.multisampling);

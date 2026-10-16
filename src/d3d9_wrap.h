@@ -24,6 +24,9 @@ bool InstallLateFactoryWrapping(Direct3DCreate9Fn create9);
 // impossible. This adopts the live device instead: wrap it, bind an INTZ depth and point the engine's
 // graphics-device singleton at the wrapper.
 bool AdoptExistingDevice();
+bool AdoptDeviceForWater(IDirect3DDevice9* real);
+void PrepareAdoptedDeviceReset(IDirect3DDevice9* real);
+void RestoreAdoptedDeviceAfterReset(IDirect3DDevice9* real);
 
 void AllowFogOnNewDevices(bool allowedOnNewDevices);
 

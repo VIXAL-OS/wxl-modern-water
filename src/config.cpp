@@ -54,7 +54,7 @@ const FloatSetting kLookFloatSettings[] = {
 
 const IntSetting kWaterIntSettings[] = {
     {"WaterQuality", &Config::waterQuality, 1, 3},
-    {"WaterDebugView", &Config::waterDebugView, 0, 6},
+    {"WaterDebugView", &Config::waterDebugView, 0, 8},
 };
 
 const FloatSetting kFloatSettings[] = {
@@ -87,6 +87,11 @@ const FloatSetting kWaterFloatSettings[] = {
     {"WaterClarity", &Config::waterClarity, 0.25f, 4.0f},
     {"WaterZoneColors", &Config::waterZoneColors, 0.0f, 1.0f},
     {"WaterRipples", &Config::waterRipples, 0.0f, 2.0f},
+    {"WaterRainRipples", &Config::waterRainRipples, 0.0f, 2.0f},
+    {"WaterRainSize", &Config::waterRainSize, 0.5f, 3.0f},
+    {"WaterRainDistance", &Config::waterRainDistance, 24.0f, 160.0f},
+    {"ShadowSlopeBias", &Config::shadowSlopeBias, 0.0f, 8.0f},
+    {"ShadowDepthBias", &Config::shadowDepthBias, 0.0f, 0.002f},
 };
 
 const BoolSetting kBoolSettings[] = {
@@ -99,6 +104,7 @@ const BoolSetting kBoolSettings[] = {
 
 const BoolSetting kWaterBoolSettings[] = {
     {"WaterClientSplashes", &Config::waterClientSplashes},
+    {"WaterRiverFlow", &Config::waterRiverFlow},
 };
 
 template <typename Visit>

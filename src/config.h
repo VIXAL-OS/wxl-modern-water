@@ -70,9 +70,17 @@ struct Config
     float waterFoam = 1.0f;
     float waterReflections = 0.75f;
     float waterSpecular = 1.0f;
+    // The client's shadow maps: added to the depth bias it draws them with (d3d9_wrap.cpp, the shadow-map bias).
+    float shadowSlopeBias = 2.0f;
+    // Rivers run: the waves slide down the current the map scan found (water_flow.h).
+    bool waterRiverFlow = true;
+    float shadowDepthBias = 0.0001f;
     float waterClarity = 0.7f;
     float waterZoneColors = 0.7f;
     float waterRipples = 0.5f;
+    float waterRainRipples = 0.6f;
+    float waterRainSize = 1.8f;
+    float waterRainDistance = 96.0f;
     bool waterClientSplashes = false;
     int waterDebugView = 0;
 };

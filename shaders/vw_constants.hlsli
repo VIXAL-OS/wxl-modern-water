@@ -29,6 +29,35 @@ float4 cReflectionFogRange : register(c64);
 float4 cRippleWindow : register(c65);
 float4 cRippleShape : register(c66);
 float4 cRippleFade : register(c67);
+float4 cRainControl : register(c68); // strength x observed outdoor rain; time modulo 256 seconds
+// Waterfall white water: count, strength, time (seconds modulo 256); per fall the base segment (a.xy, b.xy) and
+// its shape (radius yd, strength, base height, height band yd).
+static const int kMaxFallFoam = 16;
+float4 cFallFoamControl : register(c69);
+float4 cFallFoamSegments[kMaxFallFoam] : register(c70);
+float4 cFallFoamShape[kMaxFallFoam] : register(c86);
+static const int kMaxLips = 8;
+float4 cLipControl : register(c102);          // count, strength, seconds mod 256
+float4 cLipFrame[kMaxLips] : register(c103);  // lip centre xy, flow direction zw
+float4 cLipShape[kMaxLips] : register(c111);  // half width at the lip, reach upstream, surface height, strength
+float4 cCoast : register(c119);               // surf strength (the ocean pass only), seconds mod 256
+float4 cPlayer : register(c120);              // the player's feet (world), reach of their reflection (0: none)
+// The client's point lights near the camera (lamps, torches), as the fog takes them: count, strength; per lamp its
+// world position and cutoff radius (yd), its colour as the client uploads it, and its attenuation (constant, linear,
+// quadratic).
+static const int kMaxLamps = 8;
+float4 cLampControl : register(c121);
+float4 cLampPosition[kMaxLamps] : register(c122);
+float4 cLampColour[kMaxLamps] : register(c130);
+float4 cLampFalloff[kMaxLamps] : register(c138);
+float4 cRiverFlowMap : register(c146);      // sRiverFlow at world p: u = p.y * x + y, v = p.x * x + z; w = 1 with any flow
+float4 cRiverFlowControl : register(c147);  // seconds mod 256
+float4 cFloorFit0 : register(c148);         // the floor around the player (water_floor.h): z = x + y dx + z dy + ..., w = on
+float4 cFloorFit1 : register(c149);         // ... + x dx^2 + y dx dy + z dy^2
+float4 cFloorFit2 : register(c150);         // (dx, dy) = position - xy; z = the half span sampled
+float4 cFloorWide0 : register(c151);        // the same fitted wider (water_floor.h kWideReach)
+float4 cFloorWide1 : register(c152);
+float4 cFloorWide2 : register(c153);
 
 sampler2D sSceneColour : register(s0);
 sampler2D sSceneDepth : register(s1);
@@ -43,6 +72,7 @@ sampler2D sFoamState2 : register(s9);
 sampler2D sFoamState3 : register(s10);
 sampler2D sWaveFoamMasks : register(s11);
 sampler2D sRipples : register(s12);
+sampler2D sRiverFlow : register(s13);   // the current around the player (water_flow.h): r, g = 0.5 + flow / 8 yd/s
 sampler2D sShoreFoamMask : register(s14);
 sampler2D sDepthFoamMask : register(s15);
 

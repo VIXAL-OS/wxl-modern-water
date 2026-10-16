@@ -8,11 +8,14 @@
 #include "engine.h"
 #include "hooks.h"
 #include "log.h"
+#include "player_mask.h"
 #include "water_data.h"
+#include "WaterRain.hpp"
 
 #include "WxlOverlay.hpp"
 
 #include "wxl/PluginApi.h"
+#include "engine/events/Event.hpp"
 
 #include <windows.h>
 
@@ -52,6 +55,19 @@ namespace
         g_api->Log(WXL_LOG_INFO, "wxl-modern-water", "%s", line);
     }
 
+    void __cdecl OnDeviceLost(void*, const void* raw)
+    {
+        auto* args = static_cast<const wxl::events::DeviceResetArgs*>(raw);
+        player_mask::Release();
+        if (args) PrepareAdoptedDeviceReset(static_cast<IDirect3DDevice9*>(args->device));
+    }
+    void __cdecl OnFrame(void*, const void* raw)
+    {
+        auto* args = static_cast<const wxl::events::FrameArgs*>(raw);
+        player_mask::NextFrame();
+        if (args) RestoreAdoptedDeviceAfterReset(static_cast<IDirect3DDevice9*>(args->device));
+    }
+
     void Attach()
     {
         const std::string dir = ModuleDirectory(ThisModule());
@@ -86,6 +102,7 @@ namespace
         AllowFogOnNewDevices(engineHooks);
         if (engineHooks && InstallWaterHooks())
         {
+            player_mask::Install(g_api);
             if (!GlobalWaterData().Load(dir + "waterdata.bin"))
                 GlobalWaterData().Load(dir + "..\\..\\waterdata.bin");
         }
@@ -108,6 +125,9 @@ extern "C" __declspec(dllexport) int __cdecl WXL_Load(const WXL_Api* api)
 {
     if (!api || api->apiVersion != WXL_API_VERSION) return 0;
     g_api = api;
+    water_rain::Init(api);
+    api->Subscribe(static_cast<uint32_t>(wxl::events::Event::OnDeviceLost), &OnDeviceLost, nullptr);
+    api->Subscribe(static_cast<uint32_t>(wxl::events::Event::OnFrame), &OnFrame, nullptr);
     Attach();
     if (api->Log) api->Log(WXL_LOG_INFO, "wxl-modern-water", "modern water ready");
     return 1;

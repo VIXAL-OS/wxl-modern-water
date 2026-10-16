@@ -8,6 +8,7 @@
 #include "water_renderer.h"
 
 #include <cstdio>
+#include <cstring>
 
 namespace
 {
@@ -117,6 +118,9 @@ struct MultisampleDecision
 };
 }
 
+bool InstallAdoptedDeviceStateHook(IDirect3DDevice9* real);
+static FogDevice* g_adoptedDevice = nullptr;
+
 class FogDevice final : public IDirect3DDevice9
 {
 public:
@@ -126,6 +130,8 @@ public:
     bool FogActive() const { return m_fog && m_depthTexture; }
     IDirect3DDevice9* Real() const { return m_real; }
     bool CreateDepth();
+    bool AdoptDepth();
+    void ReleaseAdoptedResetResources();
     bool CopyMultisampledDepth(DepthCopyMethod method, const D3DPRESENT_PARAMETERS& used);
     void KeepSingleSampled(const char* why);
     const MultisamplingStatus& Multisampling() const { return m_multisampling; }
@@ -556,7 +562,7 @@ private:
     ~FogDevice();
     void ReleaseDepth();
     bool BindFallbackDepth();
-    SceneDepth Depth() const;
+    SceneDepth Depth();
     bool DepthWriteOverridden() const { return m_suppressDepthWrite || m_forceDepthWrite || m_waterForcesDepthWrite; }
     DWORD DepthWriteToApply() const
     {
@@ -592,6 +598,8 @@ private:
     D3DDEVTYPE m_deviceType;
     IDirect3DTexture9* m_depthTexture = nullptr;
     IDirect3DSurface9* m_depthSurface = nullptr;
+    IDirect3DTexture9* m_sharedDepthTexture = nullptr;
+    IDirect3DSurface9* m_sharedDepthSurface = nullptr;
     IDirect3DSurface9* m_clientDepth = nullptr;
     IDirect3DSurface9* m_engineDepthSurface = nullptr;
     DepthCopy m_depthCopy;
@@ -976,14 +984,44 @@ FogDevice::~FogDevice()
 void FogDevice::ReleaseDepth()
 {
     m_depthCopy.Detach();
+    ReleaseReference(m_sharedDepthSurface);
+    ReleaseReference(m_sharedDepthTexture);
     ReleaseReference(m_clientDepth);
     ReleaseReference(m_depthSurface);
     ReleaseReference(m_engineDepthSurface);
     ReleaseReference(m_depthTexture);
 }
 
-SceneDepth FogDevice::Depth() const
+SceneDepth FogDevice::Depth()
 {
+    // Another world renderer (Living Azeroth/SSAA) may provide the bound readable
+    // depth. Sample that surface instead of requiring exclusive ownership of depth.
+    IDirect3DSurface9* bound = nullptr;
+    if (!m_clientDepth && SUCCEEDED(m_real->GetDepthStencilSurface(&bound)) && bound)
+    {
+        if (bound != m_depthSurface)
+        {
+            D3DSURFACE_DESC desc{};
+            if (SUCCEEDED(bound->GetDesc(&desc)) && desc.Format == kIntz && desc.MultiSampleType == D3DMULTISAMPLE_NONE)
+            {
+                IDirect3DTexture9* texture = nullptr;
+                if (SUCCEEDED(bound->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&texture))) && texture)
+                {
+                    ReleaseReference(m_sharedDepthSurface);
+                    ReleaseReference(m_sharedDepthTexture);
+                    m_sharedDepthSurface = bound;
+                    m_sharedDepthTexture = texture;
+                    SceneDepth shared{};
+                    shared.texture = m_sharedDepthTexture;
+                    shared.bound = m_sharedDepthSurface;
+                    return shared;
+                }
+            }
+        }
+        bound->Release();
+    }
+    ReleaseReference(m_sharedDepthSurface);
+    ReleaseReference(m_sharedDepthTexture);
     SceneDepth depth;
     depth.texture = m_depthTexture;
     depth.bound = m_clientDepth ? m_clientDepth : m_depthSurface;
@@ -1186,7 +1224,15 @@ bool FogDevice::RenderGodRaysAfterWorld(const char** skip)
 bool FogDevice::BeginWater(const FrameInputs& in, const WaterInputs& water, const Config& cfg, const char** skip)
 {
     AbortWater();
-    const bool armed = FogActive() && m_water.Begin(m_real, Depth(), in, water, cfg);
+    bool armed = FogActive() && m_water.Begin(m_real, Depth(), in, water, cfg);
+    // Begin/EndStateBlock rewrites D3D9's mutable dispatch slots, including
+    // SetRenderState. Water's first state-block recording therefore removes our
+    // adopted-device hook. Re-arm it after setup, before the client's water draw.
+    if (armed && this == g_adoptedDevice && !InstallAdoptedDeviceStateHook(m_real))
+    {
+        m_water.Abort(m_real);
+        armed = false;
+    }
     if (armed)
         OverrideDepthWrite(m_waterForcesDepthWrite, true);
     if (skip)
@@ -1220,100 +1266,34 @@ bool FogDevice::Grade(const D3DVIEWPORT9& world, const float* curve, float stren
     return graded;
 }
 
-/**
- * @brief Adopts a D3D9 device the client already created.
- *
- * WarcraftXL loads extensions after the client has built its device, so creation cannot be
- * intercepted. The engine is left completely untouched: its device keeps rendering as before, and the
- * fog renderer draws through this wrapper on the same real device. When the engine renders
- * multisampled (the usual case) the engine's own depth-stencil stays bound and is resolved into a
- * single-sampled INTZ texture each frame, exactly as the original device-creation path does; when it
- * is single-sampled a matching INTZ depth is bound directly, and the engine's own depth surface is
- * swapped for it by the adopted SetDepthStencilSurface hook, so the client can rebind its depth
- * without invalidating the water pass.
- * @return true when the live device is wrapped.
- */
-static FogDevice* g_adoptedDevice = nullptr;
-
-constexpr unsigned kDeviceSetRenderStateSlot = 57;
-constexpr unsigned kDeviceSetDepthStencilSurfaceSlot = 39;
-using DeviceSetRenderStateFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
-using DeviceSetDepthStencilSurfaceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DSurface9*);
-DeviceSetRenderStateFn g_origDeviceSetRenderState = nullptr;
-DeviceSetDepthStencilSurfaceFn g_origDeviceSetDepthStencilSurface = nullptr;
-
-HRESULT STDMETHODCALLTYPE AdoptedSetRenderState(IDirect3DDevice9* self, D3DRENDERSTATETYPE state, DWORD value)
+void FogDevice::ReleaseAdoptedResetResources()
 {
-    if (state == D3DRS_ZWRITEENABLE)
-    {
-        // Remember what the client asked for so OverrideDepthWrite can put the device back exactly
-        // where the client believes it is once the water pass is over.
-        if (g_adoptedDevice && !g_depthWriteOverrideApplying)
-            g_adoptedDevice->NoteClientDepthWrite(value);
-        if (g_waterDepthWriteForced)
-            value = TRUE;
-    }
-    return g_origDeviceSetRenderState(self, state, value);
+    ReleaseOverlayDeviceObjects(m_real);
+    AbortWater();
+    m_water.ReleaseDefaultPool();
+    m_grading.ReleaseDefaultPool();
+    m_renderer.ReleaseDefaultPool();
+    m_real->SetDepthStencilSurface(nullptr);
+    ReleaseDepth();
+    m_fog = false;
+    g_waterDepthWriteForced = false;
+    if (g_latestFogDevice == this) g_latestFogDevice = nullptr;
 }
 
-HRESULT STDMETHODCALLTYPE AdoptedSetDepthStencilSurface(IDirect3DDevice9* self, IDirect3DSurface9* surface)
+bool FogDevice::AdoptDepth()
 {
-    if (g_adoptedDevice && g_adoptedDevice->SwapsEngineDepth(surface))
-        surface = g_adoptedDevice->AdoptedDepthSurface();
-    return g_origDeviceSetDepthStencilSurface(self, surface);
-}
-
-bool InstallAdoptedDeviceStateHook(IDirect3DDevice9* real)
-{
-    if (g_origDeviceSetRenderState && g_origDeviceSetDepthStencilSurface)
-        return true;
-    if (!real)
-        return false;
-    void** vtable = *reinterpret_cast<void***>(real);
-    if (!vtable)
-        return false;
-
-    DWORD old = 0;
-    if (!g_origDeviceSetRenderState)
-    {
-        g_origDeviceSetRenderState = reinterpret_cast<DeviceSetRenderStateFn>(vtable[kDeviceSetRenderStateSlot]);
-        if (!VirtualProtect(&vtable[kDeviceSetRenderStateSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
-            return false;
-        vtable[kDeviceSetRenderStateSlot] = reinterpret_cast<void*>(&AdoptedSetRenderState);
-        VirtualProtect(&vtable[kDeviceSetRenderStateSlot], sizeof(void*), old, &old);
-    }
-    if (!g_origDeviceSetDepthStencilSurface)
-    {
-        g_origDeviceSetDepthStencilSurface =
-            reinterpret_cast<DeviceSetDepthStencilSurfaceFn>(vtable[kDeviceSetDepthStencilSurfaceSlot]);
-        if (!VirtualProtect(&vtable[kDeviceSetDepthStencilSurfaceSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
-            return false;
-        vtable[kDeviceSetDepthStencilSurfaceSlot] = reinterpret_cast<void*>(&AdoptedSetDepthStencilSurface);
-        VirtualProtect(&vtable[kDeviceSetDepthStencilSurfaceSlot], sizeof(void*), old, &old);
-    }
-    return true;
-}
-
-bool AdoptExistingDevice()
-{
-    if (g_adoptedDevice)
-        return true;
-    auto* real = static_cast<IDirect3DDevice9*>(engine::GameD3DDevice());
-    if (!real)
-        return false;
-
-    IDirect3D9* d3d = nullptr;
-    if (FAILED(real->GetDirect3D(&d3d)) || !d3d)
-    {
-        VF_LOG_ERROR("device adoption: the live device exposed no IDirect3D9");
-        return false;
-    }
-
+    auto* real = m_real;
+    auto* parent = m_parent;
+    auto* device = this;
     IDirect3DSurface9* engineDepth = nullptr;
     D3DSURFACE_DESC depthDesc = {};
     if (SUCCEEDED(real->GetDepthStencilSurface(&engineDepth)) && engineDepth)
         engineDepth->GetDesc(&depthDesc);
 
+    // The client recreates its own depth after Reset returns. Wait until it is bound.
+    if (!engineDepth) return false;
+    m_depthFormat = depthDesc.Format;
+    m_fog = true;
     IDirect3DSurface9* backBuffer = nullptr;
     D3DSURFACE_DESC backDesc = {};
     if (SUCCEEDED(real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) && backBuffer)
@@ -1321,9 +1301,6 @@ bool AdoptExistingDevice()
     if (backBuffer)
         backBuffer->Release();
 
-    real->AddRef();
-    auto* parent = new WrappedD3D9(d3d);
-    auto* device = new FogDevice(parent, real, true, depthDesc.Format, 0, D3DDEVTYPE_HAL);
 
     const bool multisampled = (engineDepth ? depthDesc.MultiSampleType : backDesc.MultiSampleType) !=
                               D3DMULTISAMPLE_NONE;
@@ -1348,7 +1325,7 @@ bool AdoptExistingDevice()
         used.AutoDepthStencilFormat = depthDesc.Format;
         used.EnableAutoDepthStencil = TRUE;
         used.Windowed = TRUE;
-        const MultisampleDecision decision = parent->PrepareMultisampling(0, D3DDEVTYPE_HAL, used);
+        const MultisampleDecision decision = parent->PrepareMultisampling(m_adapter, m_deviceType, used);
         if (decision.method != DepthCopyMethod::None && device->CopyMultisampledDepth(decision.method, used))
         {
             ok = true;
@@ -1375,12 +1352,213 @@ bool AdoptExistingDevice()
             engineDepth->Release();
     }
 
-    if (!ok)
-    {
-        device->Release();
-        return false;
-    }
+    if (!ok) m_fog = false;
+    return ok;
+}
 
+/**
+ * @brief Adopts a D3D9 device the client already created.
+ *
+ * WarcraftXL loads extensions after the client has built its device, so creation cannot be
+ * intercepted. The engine is left completely untouched: its device keeps rendering as before, and the
+ * fog renderer draws through this wrapper on the same real device. When the engine renders
+ * multisampled (the usual case) the engine's own depth-stencil stays bound and is resolved into a
+ * single-sampled INTZ texture each frame, exactly as the original device-creation path does; when it
+ * is single-sampled a matching INTZ depth is bound directly, and the engine's own depth surface is
+ * swapped for it by the adopted SetDepthStencilSurface hook, so the client can rebind its depth
+ * without invalidating the water pass.
+ * @return true when the live device is wrapped.
+ */
+constexpr unsigned kDeviceSetRenderStateSlot = 57;
+constexpr unsigned kDeviceSetDepthStencilSurfaceSlot = 39;
+using DeviceSetRenderStateFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DRENDERSTATETYPE, DWORD);
+using DeviceSetDepthStencilSurfaceFn = HRESULT(STDMETHODCALLTYPE*)(IDirect3DDevice9*, IDirect3DSurface9*);
+DeviceSetRenderStateFn g_origDeviceSetRenderState = nullptr;
+DeviceSetDepthStencilSurfaceFn g_origDeviceSetDepthStencilSurface = nullptr;
+
+// --- The client's shadow maps: slope-scaled depth bias --------------------------------------------------------------
+// With the client's real-time shadows on (Shadow Quality, extShadowQuality), walls the light skims shadowed themselves
+// in fine stripes: moire on Stormwind's canal walls at night, gone with /console extShadowQuality 0 (the user,
+// 2026-10-11). Its shadow maps are depth textures (the terrain's and buildings' shaders read them on s5..s8 with the
+// hardware depth compare), and a surface's own depth, rounded in the map, lands in front of it where the light
+// grazes. While one of them is the depth target, the depth bias the client sets is raised by ShadowSlopeBias x the
+// depth's slope + ShadowDepthBias (0 and 0: drawn as the client draws it); the client's own values come back when it
+// binds another depth. In the game this runs in the adopted device's hooks (the client draws through its own device).
+struct ShadowMapBias
+{
+    DWORD clientSlope = 0;     // D3DRS_SLOPESCALEDEPTHBIAS and D3DRS_DEPTHBIAS as the client last set them (float bits)
+    DWORD clientConstant = 0;
+    bool known = false;        // the client's values have been read
+    bool raised = false;       // a shadow map is the depth target and the bias is raised
+    bool logged = false;
+};
+ShadowMapBias g_shadowMapBias;
+
+float BitsAsFloat(DWORD bits)
+{
+    float f = 0.0f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+DWORD FloatAsBits(float f)
+{
+    DWORD bits = 0;
+    std::memcpy(&bits, &f, sizeof(bits));
+    return bits;
+}
+
+bool IsHardwareDepthFormat(D3DFORMAT format)
+{
+    switch (format)
+    {
+    case D3DFMT_D16: case D3DFMT_D24X8: case D3DFMT_D24S8: case D3DFMT_D24X4S4: case D3DFMT_D32:
+    case D3DFMT_D15S1: case D3DFMT_D24FS8: case D3DFMT_D16_LOCKABLE: case D3DFMT_D32F_LOCKABLE:
+        return true;
+    default:
+        return false; // INTZ, DF24, DF16, RAWZ: depth that effects sample, not shadow maps
+    }
+}
+
+// A level of a depth-format texture: a shadow map. The client's own depth-stencil is a plain surface, and the depth
+// copies effects read (this module's own among them) are INTZ-like formats.
+bool IsShadowMapSurface(IDirect3DSurface9* surface, D3DSURFACE_DESC& desc)
+{
+    if (!surface || FAILED(surface->GetDesc(&desc)) || !(desc.Usage & D3DUSAGE_DEPTHSTENCIL) ||
+        !IsHardwareDepthFormat(desc.Format))
+        return false;
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(surface->GetContainer(__uuidof(IDirect3DTexture9), reinterpret_cast<void**>(&texture))) || !texture)
+        return false;
+    texture->Release();
+    return true;
+}
+
+DWORD RaisedShadowBias(D3DRENDERSTATETYPE state, DWORD client, const Config& cfg)
+{
+    const float extra = state == D3DRS_SLOPESCALEDEPTHBIAS ? cfg.shadowSlopeBias : cfg.shadowDepthBias;
+    return FloatAsBits(BitsAsFloat(client) + extra);
+}
+
+// After the client binds `surface` as its depth: raise the bias for a shadow map, put the client's back otherwise.
+void UpdateShadowMapBias(IDirect3DDevice9* device, IDirect3DSurface9* surface, DeviceSetRenderStateFn set)
+{
+    ShadowMapBias& b = g_shadowMapBias;
+    const Config& cfg = GlobalConfig().Get();
+    D3DSURFACE_DESC desc{};
+    const bool raise = (cfg.shadowSlopeBias > 0.0f || cfg.shadowDepthBias > 0.0f) && IsShadowMapSurface(surface, desc);
+    if (!raise && !b.raised)
+        return;
+    if (!b.known)
+    {
+        device->GetRenderState(D3DRS_SLOPESCALEDEPTHBIAS, &b.clientSlope);
+        device->GetRenderState(D3DRS_DEPTHBIAS, &b.clientConstant);
+        b.known = true;
+    }
+    b.raised = raise;
+    set(device, D3DRS_SLOPESCALEDEPTHBIAS,
+        raise ? RaisedShadowBias(D3DRS_SLOPESCALEDEPTHBIAS, b.clientSlope, cfg) : b.clientSlope);
+    set(device, D3DRS_DEPTHBIAS, raise ? RaisedShadowBias(D3DRS_DEPTHBIAS, b.clientConstant, cfg) : b.clientConstant);
+    if (raise && !b.logged)
+    {
+        b.logged = true;
+        VF_LOG_INFO("shadow maps: %ux%u depth textures (format %u); drawn with slope bias %.2f + %.2f, depth bias "
+                    "%.6f + %.6f", desc.Width, desc.Height, static_cast<unsigned>(desc.Format),
+                    BitsAsFloat(b.clientSlope), cfg.shadowSlopeBias, BitsAsFloat(b.clientConstant), cfg.shadowDepthBias);
+    }
+}
+
+HRESULT STDMETHODCALLTYPE AdoptedSetRenderState(IDirect3DDevice9* self, D3DRENDERSTATETYPE state, DWORD value)
+{
+    if ((state == D3DRS_SLOPESCALEDEPTHBIAS || state == D3DRS_DEPTHBIAS) && g_adoptedDevice &&
+        self == g_adoptedDevice->Real())
+    {
+        (state == D3DRS_SLOPESCALEDEPTHBIAS ? g_shadowMapBias.clientSlope : g_shadowMapBias.clientConstant) = value;
+        g_shadowMapBias.known = true;
+        if (g_shadowMapBias.raised)
+            value = RaisedShadowBias(state, value, GlobalConfig().Get());
+        return g_origDeviceSetRenderState(self, state, value);
+    }
+    if (state == D3DRS_ZWRITEENABLE && g_adoptedDevice && self == g_adoptedDevice->Real())
+    {
+        // Remember what the client asked for so OverrideDepthWrite can put the device back exactly
+        // where the client believes it is once the water pass is over.
+        if (g_adoptedDevice && !g_depthWriteOverrideApplying)
+            g_adoptedDevice->NoteClientDepthWrite(value);
+        if (g_waterDepthWriteForced)
+            value = TRUE;
+    }
+    return g_origDeviceSetRenderState(self, state, value);
+}
+
+HRESULT STDMETHODCALLTYPE AdoptedSetDepthStencilSurface(IDirect3DDevice9* self, IDirect3DSurface9* surface)
+{
+    const bool adopted = g_adoptedDevice && self == g_adoptedDevice->Real();
+    if (adopted && g_adoptedDevice->SwapsEngineDepth(surface))
+        surface = g_adoptedDevice->AdoptedDepthSurface();
+    const HRESULT hr = g_origDeviceSetDepthStencilSurface(self, surface);
+    if (adopted && SUCCEEDED(hr))
+        UpdateShadowMapBias(self, surface, g_origDeviceSetRenderState);
+    return hr;
+}
+
+bool InstallAdoptedDeviceStateHook(IDirect3DDevice9* real)
+{
+    if (!real)
+        return false;
+    void** vtable = *reinterpret_cast<void***>(real);
+    if (!vtable)
+        return false;
+
+    DWORD old = 0;
+    if (vtable[kDeviceSetRenderStateSlot] != reinterpret_cast<void*>(&AdoptedSetRenderState))
+    {
+        // Restore only the known runtime slot. Re-wrapping a foreign hook that
+        // already chains through ours could create a recursive hook cycle.
+        if (g_origDeviceSetRenderState && vtable[kDeviceSetRenderStateSlot] != reinterpret_cast<void*>(g_origDeviceSetRenderState))
+            return false;
+        g_origDeviceSetRenderState = reinterpret_cast<DeviceSetRenderStateFn>(vtable[kDeviceSetRenderStateSlot]);
+        if (!VirtualProtect(&vtable[kDeviceSetRenderStateSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
+            return false;
+        vtable[kDeviceSetRenderStateSlot] = reinterpret_cast<void*>(&AdoptedSetRenderState);
+        VirtualProtect(&vtable[kDeviceSetRenderStateSlot], sizeof(void*), old, &old);
+    }
+    // Depth bindings are not recorded by state blocks. Preserve later renderer
+    // hooks here instead of wrapping them around our existing hook a second time;
+    // but where the slot holds the runtime's own function again (the device's
+    // vtable was put back), hook it again: the shadow-map bias lives here too.
+    if (!g_origDeviceSetDepthStencilSurface ||
+        vtable[kDeviceSetDepthStencilSurfaceSlot] == reinterpret_cast<void*>(g_origDeviceSetDepthStencilSurface))
+    {
+        if (!g_origDeviceSetDepthStencilSurface)
+            g_origDeviceSetDepthStencilSurface =
+                reinterpret_cast<DeviceSetDepthStencilSurfaceFn>(vtable[kDeviceSetDepthStencilSurfaceSlot]);
+        if (!VirtualProtect(&vtable[kDeviceSetDepthStencilSurfaceSlot], sizeof(void*), PAGE_EXECUTE_READWRITE, &old))
+            return false;
+        vtable[kDeviceSetDepthStencilSurfaceSlot] = reinterpret_cast<void*>(&AdoptedSetDepthStencilSurface);
+        VirtualProtect(&vtable[kDeviceSetDepthStencilSurfaceSlot], sizeof(void*), old, &old);
+    }
+    return true;
+}
+
+bool AdoptExistingDevice()
+{
+    return AdoptDeviceForWater(static_cast<IDirect3DDevice9*>(engine::GameD3DDevice()));
+}
+
+bool AdoptDeviceForWater(IDirect3DDevice9* real)
+{
+    if (g_adoptedDevice) return g_adoptedDevice->Real() == real;
+    if (!real) return false;
+    IDirect3D9* d3d = nullptr;
+    if (FAILED(real->GetDirect3D(&d3d)) || !d3d) return false;
+    D3DDEVICE_CREATION_PARAMETERS creation{};
+    if (FAILED(real->GetCreationParameters(&creation))) { d3d->Release(); return false; }
+    real->AddRef();
+    auto* parent = new WrappedD3D9(d3d);
+    auto* device = new FogDevice(parent, real, true, D3DFMT_UNKNOWN, creation.AdapterOrdinal, creation.DeviceType);
+    parent->Release(); // FogDevice owns the remaining factory reference.
+    if (!device->AdoptDepth()) { device->Release(); return false; }
     // The engine keeps using its own device; the hooks pick this wrapper up via WrapperOrLatestFogDevice.
     // Its SetRenderState is patched so the forced water depth write survives what the client does
     // inside the water draw, and its SetDepthStencilSurface is patched so the client's own depth
@@ -1395,9 +1573,29 @@ bool AdoptExistingDevice()
     }
     g_latestFogDevice = device;
     g_adoptedDevice = device;
-    VF_LOG_INFO("device adoption installed: live device %p wrapped (%s), engine untouched",
-                static_cast<void*>(real), how);
+    VF_LOG_INFO("device adoption installed: live device %p wrapped, engine untouched",
+                static_cast<void*>(real));
     return true;
+}
+
+static bool g_adoptedResetPending = false;
+
+void PrepareAdoptedDeviceReset(IDirect3DDevice9* real)
+{
+    if (!g_adoptedDevice || g_adoptedDevice->Real() != real) return;
+    g_adoptedResetPending = true;
+    g_adoptedDevice->ReleaseAdoptedResetResources();
+    VF_LOG_INFO("device adoption: released resources before client Reset");
+}
+
+void RestoreAdoptedDeviceAfterReset(IDirect3DDevice9* real)
+{
+    if (!g_adoptedResetPending || !g_adoptedDevice || g_adoptedDevice->Real() != real) return;
+    if (real->TestCooperativeLevel() != D3D_OK) return;
+    if (!g_adoptedDevice->AdoptDepth()) return;
+    g_latestFogDevice = g_adoptedDevice;
+    g_adoptedResetPending = false;
+    VF_LOG_INFO("device adoption: restored depth after client Reset");
 }
 
 void SetRealDirect3DCreate9(Direct3DCreate9Fn fn)

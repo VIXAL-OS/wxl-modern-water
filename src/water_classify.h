@@ -5,7 +5,7 @@
 #include <cstdint>
 
 constexpr uint32_t kLiquidMaterialWater = 1;
-// Ocean sound-bank water is folded into the lake class (see ClassifyLiquid).
+// Ocean sound-bank water is the ocean class (see ClassifyLiquid).
 constexpr uint32_t kLiquidSoundBankOcean = 1;
 constexpr uint32_t kLiquidTypeFastWater = 9;
 // Liquid type 17 is WMO interior water. It is intentionally never surfaced as its
@@ -42,15 +42,18 @@ inline bool HasWaterSurfaceTexture(const char* texture0)
     return ContainsIgnoringCase(texture0, kRiverTextureFolder) || ContainsIgnoringCase(texture0, kOceanTextureFolder);
 }
 
-// WMO interior water (liquid type 17) and ocean sound-bank water have no surface
-// identity of their own: they are folded into the lake class so neither can
-// override a genuine lake. Only fast water (type 9) stays distinct.
+// WMO interior water (liquid type 17) has no surface identity of its own: it is folded into the lake class. Fast water
+// (type 9) is the river class. Ocean sound-bank water is the ocean class: the same preset as lake water
+// (ForeverLiquidOf), shaded in a pass of its own, which alone gets the surf at the coast (cCoast; the user,
+// 2026-10-11: "waves at coastlines specifically").
 inline WaterClass ClassifyLiquid(uint32_t liquidTypeId, uint32_t soundBank, uint32_t materialId, const char* texture0)
 {
     if (materialId != kLiquidMaterialWater || !HasWaterSurfaceTexture(texture0))
         return WaterClass::None;
     if (liquidTypeId == kLiquidTypeFastWater)
         return WaterClass::River;
+    if (soundBank == kLiquidSoundBankOcean && liquidTypeId != kLiquidTypeWmoWaterInterior)
+        return WaterClass::Ocean;
     return WaterClass::Lake;
 }
 

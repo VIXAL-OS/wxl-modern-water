@@ -3,14 +3,19 @@
 #include "fog_model.h"
 #include "fullscreen_triangle.h"
 #include "log.h"
+#include "player_mask.h"
 #include "water_classify.h"
 #include "water_data.h"
+#include "WaterRain.hpp"
 
 #include "ps_vw_depth.h"
 #include "ps_vw_depth_packed.h"
+#include "ps_vw_depth_push.h"
 #include "ps_vw_shade_high.h"
+#include "ps_vw_shade_high_mask.h"
 #include "ps_vw_shade_low.h"
 #include "ps_vw_shade_mid.h"
+#include "ps_vw_shade_mid_mask.h"
 #include "vs_fullscreen.h"
 
 #include <algorithm>
@@ -20,7 +25,7 @@
 
 namespace
 {
-constexpr UINT kWaterPixelConstants = 72;
+constexpr UINT kWaterPixelConstants = 154;
 constexpr DWORD kWaterSamplerStages = 16;
 constexpr UINT kCommonConstants = 9;
 constexpr UINT kShadingFirstConstant = 9;
@@ -32,6 +37,7 @@ constexpr DWORD kFirstSurfaceStage = 3;
 constexpr DWORD kFirstFoamStateStage = 7;
 constexpr DWORD kWaveFoamMaskStage = 11;
 constexpr DWORD kRippleStage = 12;
+constexpr DWORD kRiverFlowStage = 13;
 constexpr DWORD kShoreFoamMaskStage = 14;
 constexpr DWORD kDepthFoamMaskStage = 15;
 constexpr int kShoreFoamSlot = static_cast<int>(WaterMaskSlot::ShoreFoam);
@@ -39,6 +45,38 @@ constexpr int kDepthFoamSlot = static_cast<int>(WaterMaskSlot::DepthFoam);
 constexpr double kRippleGapSeconds = 1.0;
 constexpr float kRippleEdgeRampPerExtent = 1.0f / 16.0f;
 constexpr float kRippleFadeYards = 4.0f;
+constexpr float kRippleBobberMarginYards = 1.0f;
+constexpr float kWaterfallFoamRange = 120.0f;
+// How strongly a lip smooths and streams the water before the edge (vw_surface.hlsli SampleLips), 0 = off.
+constexpr float kLipStrength = 1.0f;
+// How strongly the ocean's swell rolls in and breaks at the shore (vw_surface.hlsli CoastSurf), 0 = off.
+constexpr float kCoastSurfStrength = 1.0f;
+// How far from the middle of the player (and mount) a reflection hit counts as the player (vw_reflection.hlsli: not
+// shown in water more than 5 yd below their feet). A mount's wings and tail reach well past 3.5 yd: a flyer on a drake
+// still saw it in the sea far below ("i do still see incorrect far reflections tho", the user, 2026-10-11).
+constexpr float kPlayerReflectionReach = 3.5f;
+constexpr float kMountedReflectionReach = 9.0f;
+// On foot the body's reach over the bed (vw_surface.hlsli kBodyRadius).
+constexpr float kBodyReach = 3.0f;
+// How strongly the client's point lights (lamps, torches) shine on the water (vw_optics.hlsli LampsOnWater), 0 = off.
+constexpr float kLampStrength = 1.0f;
+constexpr float kRippleBiasYardsPerSecond = 40.0f;
+constexpr double kRippleBiasMaxStepSeconds = 0.25;
+// Another player's far bobber doesn't pull the window while the player is touching the water (a unit in the
+// water this close to the camera target): the player's own ripples come first.
+constexpr float kRippleSelfContactYards = 2.5f;
+// Once shaded, the water's depth moves this far straight down (vw_depth_push.hlsl), so models made to lie on the
+// water or just under it (a fountain's foam sheet 4 cm down, splash decals) draw over it as over the client's own
+// water; at a grazing view the move along the view is capped.
+constexpr float kWaterDepthPushYards = 0.1f;
+constexpr float kWaterDepthPushMaxViewYards = 1.0f;
+// At the lips of the falls nearby (vw_depth_push.hlsl cLip): the river's surface overhangs the edge, so there the water
+// moves down by the fall's height (at most kLipPushMaxYards) within kLipReachYards of the box's top edge beyond half its
+// thickness, for falls at least kLipPushMinHeight tall.
+constexpr uint32_t kMaxPushLips = 8;
+constexpr float kLipReachYards = 3.0f;
+constexpr float kLipPushMinHeight = 3.0f;
+constexpr float kLipPushMaxYards = 40.0f;
 constexpr DWORD kStencilAllBits = 0xFF;
 constexpr DWORD kColourWriteRgb = D3DCOLORWRITEENABLE_RED | D3DCOLORWRITEENABLE_GREEN | D3DCOLORWRITEENABLE_BLUE;
 constexpr DWORD kColourWriteAll = kColourWriteRgb | D3DCOLORWRITEENABLE_ALPHA;
@@ -56,6 +94,7 @@ constexpr float kSunVisibilityHalfWidth = 0.1f;
 constexpr float kWaterF0 = 0.02f;
 constexpr int kSchlickExponent = 5;
 constexpr float kMinClarity = 0.01f;
+constexpr float kDefaultWaterClarity = 0.7f;
 constexpr float kShoreDistancePerDepth = 4.0f;
 constexpr float kMinStockFogRange = 1e-3f;
 constexpr double kMaxFoamStepSeconds = 0.1;
@@ -275,6 +314,11 @@ void LinearColour(uint32_t argb, float* rgb)
         rgb[c] = std::pow(rgb[c], kDisplayGamma);
 }
 
+float LinearLuma(const float* rgb)
+{
+    return 0.2126f * rgb[0] + 0.7152f * rgb[1] + 0.0722f * rgb[2];
+}
+
 void ClampedTint(const float* linearTint, float* rgb)
 {
     for (int c = 0; c < 3; ++c)
@@ -448,6 +492,64 @@ void ForceWaterSummary()
     g_summaryForced = true;
 }
 
+// The zone colours are the client's river colours, and in linear light they are dark next to the preset: Stormwind's
+// canal teal (41, 67, 58) is about 0.05 against the preset's sky blue at 0.5. Blended as they were, the preset's blue
+// won at any weight short of 1, and at 1 the water went dark: the canals looked "blue raspberry blue" (the user,
+// 2026-10-10). The zone now lends its hue at the preset's brightness, then the weight blends as before.
+void ZoneTintedColour(const float* authored, const float* zone, float weight, float* out)
+{
+    const float zoneLuma = LinearLuma(zone);
+    const float scale = zoneLuma > 1e-4f ? LinearLuma(authored) / zoneLuma : 0.0f;
+    const float w = Saturate(weight);
+    for (int c = 0; c < 3; ++c)
+    {
+        const float target = zoneLuma > 1e-4f ? zone[c] * scale : authored[c];
+        out[c] = authored[c] + (target - authored[c]) * w;
+    }
+}
+
+// The colour behind clear water is mostly the absorption's: the lake preset takes red fastest and blue slowest, so a
+// few yards of it turn a grey canal floor sky blue whatever the scattering colour says, and the canals stayed "still
+// blue" with the zone hue in the scattering (the user, 2026-10-10). Giving that light the zone's hue at the preset's
+// brightness then made it bright green: the clear preset still showed the lamp-lit floor. The client's own water is
+// nearly opaque there (Stormwind's LightParams: waterShallowAlpha 0.85, against 0.5 in most places), so the light
+// through kZoneAbsorptionDepth yards now takes the zone's hue at 1 - that opacity: murky canals, and zones with the
+// usual 0.5 close to the preset. The coefficients that give it are blended in by the weight.
+void ZoneTintedAbsorption(const float* presetPerYard, const float* zone, float opacity, float clarityGain, float weight,
+                          float* out)
+{
+    // Yards: a canal or a pond's shallows. At 3 the canals were "pretty fuckin good in the rising sun but could stand
+    // to be a bit less opaque" (the user, 2026-10-11): over 4 a canal floor 3 yd down keeps 31% of its light, not 22%.
+    constexpr float kZoneAbsorptionDepth = 4.0f;
+    constexpr float kMinTransmittance = 1e-3f;
+    constexpr float kMaxTransmittance = 0.999f;
+    constexpr float kMinLetThrough = 0.05f;
+    constexpr float kMaxLetThrough = 0.95f;
+    const float zoneLuma = LinearLuma(zone);
+    const float w = Saturate(weight);
+    float preset[3];
+    for (int c = 0; c < 3; ++c)
+        preset[c] = std::exp(-std::max(presetPerYard[c], 0.0f) * kZoneAbsorptionDepth);
+    const bool byOpacity = opacity >= 0.0f && opacity <= 1.0f;
+    const float letThrough =
+        byOpacity ? std::min(std::max(1.0f - opacity, kMinLetThrough), kMaxLetThrough) : LinearLuma(preset);
+    const float gain = byOpacity && clarityGain > 0.0f ? clarityGain : 1.0f;
+    // The light keeps kZoneHueShare of the zone's hue: all of it turned the pale stone of Stormwind's canal walls
+    // chartreuse a yard down ("simon says the walls look too green", the user, 2026-10-11); the brightness is the same.
+    constexpr float kZoneHueShare = 0.6f;
+    for (int c = 0; c < 3; ++c)
+    {
+        float target = presetPerYard[c];
+        if (zoneLuma > 1e-4f)
+        {
+            const float hue = 1.0f + (zone[c] / zoneLuma - 1.0f) * kZoneHueShare;
+            const float transmitted = std::min(std::max(letThrough * hue, kMinTransmittance), kMaxTransmittance);
+            target = -std::log(transmitted) / kZoneAbsorptionDepth * gain;
+        }
+        out[c] = presetPerYard[c] + (target - presetPerYard[c]) * w;
+    }
+}
+
 WaterRenderer::~WaterRenderer()
 {
     ReleaseAll();
@@ -485,9 +587,13 @@ void WaterRenderer::ReleaseAll()
     SafeRelease(m_decl);
     SafeRelease(m_depthCopy);
     SafeRelease(m_packedDepthCopy);
+    SafeRelease(m_depthPush);
     for (auto*& shader : m_shade)
         SafeRelease(shader);
+    for (auto*& shader : m_shadeMasked)
+        SafeRelease(shader);
     SafeRelease(m_flat);
+    m_riverFlow.Release();
     m_fft.ReleaseAll();
     m_ripples.ReleaseAll();
 }
@@ -523,9 +629,12 @@ bool WaterRenderer::EnsureShaders(IDirect3DDevice9* dev)
     const PixelShaderRequest pixels[] = {
         {"ps_vw_depth", g_ps_vw_depth, &m_depthCopy},
         {"ps_vw_depth_packed", g_ps_vw_depth_packed, &m_packedDepthCopy},
+        {"ps_vw_depth_push", g_ps_vw_depth_push, &m_depthPush},
         {"ps_vw_shade_low", g_ps_vw_shade_low, &m_shade[0]},
         {"ps_vw_shade_mid", g_ps_vw_shade_mid, &m_shade[1]},
         {"ps_vw_shade_high", g_ps_vw_shade_high, &m_shade[2]},
+        {"ps_vw_shade_mid_mask", g_ps_vw_shade_mid_mask, &m_shadeMasked[1]},
+        {"ps_vw_shade_high_mask", g_ps_vw_shade_high_mask, &m_shadeMasked[2]},
     };
     static const D3DVERTEXELEMENT9 kElements[] = {
         {0, 0, D3DDECLTYPE_FLOAT4, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0},
@@ -605,11 +714,16 @@ bool WaterRenderer::EnsureCopies(IDirect3DDevice9* dev, IDirect3DSurface9* targe
     target->GetDesc(&desc);
     const bool colour = CreateTarget(dev, w, h, desc.Format, &m_sceneColour) ||
                         CreateTarget(dev, w, h, D3DFMT_A8R8G8B8, &m_sceneColour);
-    m_packedDepth = g_packedDepthForced || !CreateTarget(dev, w, h, D3DFMT_R32F, &m_sceneDepth) ||
+    // The scene's depth with the player mask beside it (g) where two-channel float targets can be drawn; plain R32F
+    // (the reflections guess the player's shape) or packed RGBA8 where not.
+    m_maskInDepth = !g_packedDepthForced && CreateTarget(dev, w, h, D3DFMT_G32R32F, &m_sceneDepth);
+    m_packedDepth = g_packedDepthForced ||
+                    (!m_maskInDepth && !CreateTarget(dev, w, h, D3DFMT_R32F, &m_sceneDepth)) ||
                     !CreateTarget(dev, w, h, D3DFMT_R32F, &m_waterDepth);
     bool depth = !m_packedDepth;
     if (m_packedDepth)
     {
+        m_maskInDepth = false;
         SafeRelease(m_sceneDepth);
         SafeRelease(m_waterDepth);
         depth = CreateTarget(dev, w, h, D3DFMT_A8R8G8B8, &m_sceneDepth) &&
@@ -627,12 +741,14 @@ bool WaterRenderer::EnsureCopies(IDirect3DDevice9* dev, IDirect3DSurface9* targe
     m_copyW = w;
     m_copyH = h;
     m_packedDepthForcedCopies = g_packedDepthForced;
-    const bool newCopies = w != m_loggedCopyW || h != m_loggedCopyH || m_packedDepth != m_loggedPackedDepth;
+    const bool newCopies = w != m_loggedCopyW || h != m_loggedCopyH || m_packedDepth != m_loggedPackedDepth ||
+                           m_maskInDepth != m_loggedMaskInDepth;
+    m_loggedMaskInDepth = m_maskInDepth;
     m_loggedCopyW = w;
     m_loggedCopyH = h;
     m_loggedPackedDepth = m_packedDepth;
     LogWrite(newCopies ? LogLevel::Info : LogLevel::Debug, "water copies: %ux%u, depth %s", w, h,
-             m_packedDepth ? "packed rgba8" : "r32f");
+             m_packedDepth ? "packed rgba8" : m_maskInDepth ? "g32r32f (with the player mask)" : "r32f");
     return true;
 }
 
@@ -896,12 +1012,23 @@ bool WaterRenderer::CopySceneColour(IDirect3DDevice9* dev, IDirect3DSurface9* ta
     return copied;
 }
 
-void WaterRenderer::CopyLinearDepth(IDirect3DDevice9* dev, IDirect3DTexture9* depthTexture, IDirect3DTexture9* copy)
+void WaterRenderer::CopyLinearDepth(IDirect3DDevice9* dev, IDirect3DTexture9* depthTexture, IDirect3DTexture9* copy,
+                                     bool withPlayerMask)
 {
     SetTarget(dev, copy);
     dev->SetPixelShader(m_packedDepth ? m_packedDepthCopy : m_depthCopy);
     dev->SetPixelShaderConstantF(0, &m_common[0][0], kCommonConstants);
     BindPointSampler(dev, 0, depthTexture, D3DTADDRESS_CLAMP);
+    // The player's pixels this frame (player_mask.h), into the copy's g: vw_linear_depth.hlsl cPlayerMask.
+    UINT maskW = 0, maskH = 0;
+    IDirect3DTexture9* mask = withPlayerMask && m_maskInDepth ? player_mask::ThisFrame(dev, maskW, maskH) : nullptr;
+    const float maskConstant[4] = {mask ? 1.0f : 0.0f, mask ? 1.0f / static_cast<float>(maskW) : 0.0f,
+                                   mask ? 1.0f / static_cast<float>(maskH) : 0.0f, 0.0f};
+    dev->SetPixelShaderConstantF(kCommonConstants, maskConstant, 1);
+    if (mask)
+        BindPointSampler(dev, 1, mask, D3DTADDRESS_CLAMP);
+    if (withPlayerMask)
+        m_playerMaskCopied = mask != nullptr;
     DrawFullscreenTriangle(dev);
 }
 
@@ -943,6 +1070,7 @@ bool WaterRenderer::Begin(IDirect3DDevice9* dev, const SceneDepth& depth, const 
                           const WaterInputs& water, const Config& cfg)
 {
     m_skip = "";
+    m_playerMaskCopied = false;
     if (m_armed)
         Abort(dev);
     if (!cfg.water)
@@ -985,7 +1113,7 @@ bool WaterRenderer::Begin(IDirect3DDevice9* dev, const SceneDepth& depth, const 
         dev->SetDepthStencilSurface(nullptr);
         SetPassState(dev);
         RaiseInjectedFault(WaterFaultStage::Begin);
-        CopyLinearDepth(dev, depth.texture, m_sceneDepth);
+        CopyLinearDepth(dev, depth.texture, m_sceneDepth, true);
         ClearWaterStencil(dev, m_saved.colour[0], depth.bound, vp);
     }
     RestoreTargets(dev);
@@ -1110,13 +1238,20 @@ bool WaterRenderer::SimulateRipples(IDirect3DDevice9* dev, double seconds)
     m_rippleMapId = m_in.mapId;
     m_contacts.Update(m_water.contacts, seconds);
     m_summaryContacts = std::max(m_summaryContacts, m_contacts.Contacts());
+    m_summaryBobbers = std::max(m_summaryBobbers, m_water.contacts.bobberCount);
+    m_summaryFishingNodes = std::max(m_summaryFishingNodes, m_water.contacts.fishingNodes);
+    m_summaryRejectedNodes = std::max(m_summaryRejectedNodes, m_water.contacts.rejectedNodes);
+    m_summarySchools = std::max(m_summarySchools, m_water.contacts.schoolCount);
+    const int texels = m_cfg.waterQuality == kLowQuality ? kWaterRippleTexelsLow : kWaterRippleTexels;
+    float centre[2];
+    RippleCentre(seconds, texels, centre);
+    CollectRippleWaterfalls(centre, texels);
     const bool supported = m_ripples.Supported(dev);
     if (!m_ripples.Running() && !m_contacts.Emitting())
     {
         m_ripplesAvailable = m_ripplesAvailable && supported;
         return false;
     }
-    const int texels = m_cfg.waterQuality == kLowQuality ? kWaterRippleTexelsLow : kWaterRippleTexels;
     m_ripplesAvailable = m_ripples.Prepare(dev, texels);
     if (!m_ripplesAvailable)
     {
@@ -1130,17 +1265,173 @@ bool WaterRenderer::SimulateRipples(IDirect3DDevice9* dev, double seconds)
     if (!m_ripples.Running())
         m_contacts.PlaceFootprints(seconds);
     const WaterRippleSchedule schedule = m_ripples.Schedule(seconds);
-    const float centre[2] = {m_in.camTarget[0], m_in.camTarget[1]};
     WaterRippleDisturbance disturbances[kMaxWaterRippleDisturbances];
+    // The current around the player (water_flow.h): the ripples drift with it.
+    float flowMapping[4] = {};
+    const bool riverFlow = m_cfg.waterRiverFlow && m_riverFlow.Update(dev, m_in.mapId, RippleFocus());
+    if (riverFlow)
+        m_riverFlow.Mapping(flowMapping);
     for (int step = 0; step < schedule.steps; ++step)
     {
         const uint32_t count =
             m_contacts.TakeDisturbances(schedule.stepSeconds[step], disturbances, kMaxWaterRippleDisturbances);
-        m_ripples.Step(dev, centre, disturbances, count);
+        m_ripples.Step(dev, centre, disturbances, count, riverFlow ? m_riverFlow.Texture() : nullptr,
+                       riverFlow ? flowMapping : nullptr);
     }
     m_summaryRippleTexels = std::max(m_summaryRippleTexels, texels);
     m_summaryDroppedSteps += schedule.dropped;
     return m_ripples.Visible();
+}
+
+// Where ripples centre: the player when the contact walk found them, else the client's camera target (a yard in
+// front of the camera, which a zoomed-out camera holds 10-50 yd from the player: centred there, the window swung
+// with the camera and the player's own wakes and footsteps slid out of it and blinked away).
+const float* WaterRenderer::RippleFocus() const
+{
+    return m_water.contacts.hasPlayer ? m_water.contacts.player : m_in.camTarget;
+}
+
+// The window follows the player, leaning toward a bobber that a long cast put in the faded edge: the
+// player's own if there is one, else the nearest far one (another player's), just far enough that it is at full
+// strength and at most halfway, so the player stays in too. It leans out at once, so the landing plop (due the
+// frame the bobber appears) is inside, and glides back once the bobber is gone so wakes behind the player do not
+// pop back in. While the player is in the water (swimming, wading, walking on it), only their own bobber leans it:
+// leaning toward someone else's slid the player's own wakes and footsteps to the faded edge, so they blinked out.
+void WaterRenderer::RippleCentre(double seconds, int texels, float centre[2])
+{
+    const float* focus = RippleFocus();
+    float target[2] = {0.0f, 0.0f};
+    float bobber[2];
+    bool own = false;
+    const float extent = texels * kWaterRippleTexelYards;
+    const float reach = extent * (0.5f - kRippleEdgeRampPerExtent) - kRippleFadeYards - kRippleBobberMarginYards;
+    if (m_contacts.FocusBobber(focus, reach, bobber, &own) &&
+        (own || !m_contacts.ContactNear(focus, kRippleSelfContactYards)))
+    {
+        const float dx = bobber[0] - focus[0];
+        const float dy = bobber[1] - focus[1];
+        const float distance = std::hypot(dx, dy);
+        if (reach > 0.0f && distance > reach)
+        {
+            const float shift = std::min(distance - reach, 0.5f * distance);
+            target[0] = dx / distance * shift;
+            target[1] = dy / distance * shift;
+        }
+    }
+    const double elapsed = m_lastBiasSeconds >= 0.0
+                               ? std::clamp(seconds - m_lastBiasSeconds, 0.0, kRippleBiasMaxStepSeconds)
+                               : kRippleBiasMaxStepSeconds;
+    m_lastBiasSeconds = seconds;
+    const bool leaningOut = std::hypot(target[0], target[1]) > std::hypot(m_rippleBias[0], m_rippleBias[1]);
+    const float step = static_cast<float>(kRippleBiasYardsPerSecond * elapsed);
+    const float delta[2] = {target[0] - m_rippleBias[0], target[1] - m_rippleBias[1]};
+    const float length = std::hypot(delta[0], delta[1]);
+    const float scale = leaningOut || length <= step ? 1.0f : step / length;
+    for (int axis = 0; axis < 2; ++axis)
+    {
+        m_rippleBias[axis] += delta[axis] * scale;
+        centre[axis] = focus[axis] + m_rippleBias[axis];
+    }
+}
+
+// Waterfalls on this map whose base lies inside the ripple window (plus a little, for wide falls at the edge), in
+// the height band around the player. One line per map change says how many the map has nearby.
+void WaterRenderer::CollectRippleWaterfalls(const float centre[2], int texels)
+{
+    const WaterfallEmitter* active[kMaxActiveWaterfalls];
+    const float range = 0.5f * texels * kWaterRippleTexelYards + kRippleFadeYards;
+    const float height = RippleFocus()[2];
+    const uint32_t count = CollectWaterfalls(m_in.mapId, centre, height, range, active, kMaxActiveWaterfalls);
+    m_contacts.SetWaterfalls(active, count);
+    // Rocks in moving water inside the window (water_flow.h): held still while the current runs past them.
+    const RiverRock* rocks[kMaxActiveRocks];
+    float flows[kMaxActiveRocks * 2] = {};
+    uint32_t rockCount = 0;
+    if (m_cfg.waterRiverFlow)
+    {
+        const RiverRock* found[kMaxActiveRocks];
+        const uint32_t n = CollectRiverRocks(m_in.mapId, centre, height, range, found, kMaxActiveRocks);
+        for (uint32_t i = 0; i < n; ++i)
+        {
+            float fx = 0.0f, fy = 0.0f;
+            if (!RiverFlowAt(m_in.mapId, found[i]->x, found[i]->y, fx, fy))
+                continue;
+            rocks[rockCount] = found[i];
+            flows[2 * rockCount] = fx;
+            flows[2 * rockCount + 1] = fy;
+            ++rockCount;
+        }
+    }
+    m_contacts.SetRocks(rocks, flows, rockCount);
+    m_summaryWaterfalls = std::max(m_summaryWaterfalls, count);
+    float nearest = 0.0f, baseHeight = 0.0f;
+    if (NearestWaterfall(m_in.mapId, centre, kWaterfallLogRange, nearest, baseHeight) && nearest < m_summaryNearestFall)
+    {
+        m_summaryNearestFall = nearest;
+        m_summaryNearestFallDrop = height - baseHeight;
+    }
+    if (m_in.mapId != m_loggedWaterfallMap)
+    {
+        m_loggedWaterfallMap = m_in.mapId;
+        uint32_t onMap = 0, total = 0;
+        const WaterfallEmitter* table = WaterfallTable(total);
+        for (uint32_t i = 0; i < total; ++i)
+            onMap += table[i].map == m_in.mapId;
+        VF_LOG_INFO("water waterfalls: map %d has %u turbulence sources (of %u)", m_in.mapId, onMap, total);
+    }
+}
+
+// White water at the waterfalls in view: the nearest 16 within kWaterfallFoamRange of the player, in their height
+// band (the same lookup as the churn). Radius and strength by kind; the height band is tight indoors,
+// where levels stack, and grows with a tall outdoor fall, whose box can reach well below the pool's surface.
+// The lips near the player (falls' "hat" models: where a river runs smooth and fast over the edge), the nearest 8
+// within the foam range and the same height band. Per lip: its centre and flow direction (the right-hand normal of
+// a -> b), the half width at the edge, how far upstream the approach shows, and its surface height.
+void WaterRenderer::FillLips(ShadingConstants& c, const FrameInputs& in, double seconds) const
+{
+    const WaterfallEmitter* lips[kMaxActiveLips];
+    const float* focus = RippleFocus();
+    const uint32_t count = CollectLips(in.mapId, focus, focus[2], kWaterfallFoamRange, lips, kMaxActiveLips);
+    c.lipControl = {static_cast<float>(count), kLipStrength,
+                    static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)), 0.0f};
+    for (uint32_t i = 0; i < kMaxActiveLips; ++i)
+    {
+        if (i >= count)
+        {
+            c.lipFrame[i] = {};
+            c.lipShape[i] = {};
+            continue;
+        }
+        const WaterfallEmitter& e = *lips[i];
+        const float dx = e.b[0] - e.a[0], dy = e.b[1] - e.a[1];
+        const float width = std::hypot(dx, dy);
+        const float inverse = width > 0.01f ? 1.0f / width : 0.0f;
+        c.lipFrame[i] = {0.5f * (e.a[0] + e.b[0]), 0.5f * (e.a[1] + e.b[1]), dy * inverse, -dx * inverse};
+        c.lipShape[i] = {0.5f * width, std::max(e.thickness, 1.0f), 0.5f * (e.a[2] + e.b[2]), 1.0f};
+    }
+}
+
+void WaterRenderer::FillFallFoam(ShadingConstants& c, const FrameInputs& in, double seconds) const
+{
+    const WaterfallEmitter* falls[kMaxActiveWaterfalls];
+    const float* focus = RippleFocus();
+    const uint32_t count =
+        CollectWaterfalls(in.mapId, focus, focus[2], kWaterfallFoamRange, falls, kMaxActiveWaterfalls);
+    c.fallFoamControl = {static_cast<float>(count), 1.0f, static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)),
+                         0.0f};
+    for (uint32_t i = 0; i < kMaxActiveWaterfalls; ++i)
+    {
+        if (i >= count)
+        {
+            c.fallFoamSegments[i] = {};
+            c.fallFoamShape[i] = {};
+            continue;
+        }
+        float segment[4], shape[4];
+        FallFoamShape(*falls[i], segment, shape);
+        c.fallFoamSegments[i] = {segment[0], segment[1], segment[2], segment[3]};
+        c.fallFoamShape[i] = {shape[0], shape[1], shape[2], shape[3]};
+    }
 }
 
 void WaterRenderer::FillRippleConstants(double seconds)
@@ -1216,8 +1507,8 @@ void WaterRenderer::FillClassConstants(ShadingConstants& c, const WaterPreset& p
     }
 
     const float absorptionScale = preset.absorption[3] / std::max(m_cfg.waterClarity, kMinClarity);
-    c.absorption = {preset.absorption[0] * absorptionScale, preset.absorption[1] * absorptionScale,
-                    preset.absorption[2] * absorptionScale, 0.0f};
+    const float presetAbsorption[3] = {preset.absorption[0] * absorptionScale, preset.absorption[1] * absorptionScale,
+                                       preset.absorption[2] * absorptionScale};
     c.scatteringIntensities = {preset.scatteringIntensities[0], preset.scatteringIntensities[1],
                                preset.scatteringIntensities[2], preset.scatteringIntensities[3]};
     // Lake is the only shading class now; it uses the river/lake zone palette.
@@ -1228,12 +1519,18 @@ void WaterRenderer::FillClassConstants(ShadingConstants& c, const WaterPreset& p
     LinearColour(zone[kFarWaterColour], farWater);
     const float zoneWeight = Saturate(m_cfg.waterZoneColors);
     auto towardZone = [zoneWeight](const float* authored, const float* zoneColour, float w) {
-        return Float4{authored[0] + (zoneColour[0] - authored[0]) * zoneWeight,
-                      authored[1] + (zoneColour[1] - authored[1]) * zoneWeight,
-                      authored[2] + (zoneColour[2] - authored[2]) * zoneWeight, w};
+        float rgb[3];
+        ZoneTintedColour(authored, zoneColour, zoneWeight, rgb);
+        return Float4{rgb[0], rgb[1], rgb[2], w};
     };
     c.scatteringTop = towardZone(preset.scatteringTop, closeWater, preset.scatteringTop[3]);
     c.scatteringBottom = towardZone(preset.scatteringBottom, farWater, preset.scatteringBottom[3]);
+    float absorption[3];
+    // The Clarity slider scales the zone's opacity as it scales the preset (0.7 is its default).
+    const float opacity = m_water.waterAlphaValid ? m_water.waterAlpha[0] : -1.0f;
+    ZoneTintedAbsorption(presetAbsorption, closeWater, opacity,
+                         kDefaultWaterClarity / std::max(m_cfg.waterClarity, kMinClarity), zoneWeight, absorption);
+    c.absorption = {absorption[0], absorption[1], absorption[2], 0.0f};
 
     const float foam = std::max(m_cfg.waterFoam, 0.0f);
     c.depthFadeFoam = {std::max(preset.depthFadeFoam[0], 0.0f) * foam, preset.depthFadeFoam[1],
@@ -1263,12 +1560,32 @@ void WaterRenderer::FillClassConstants(ShadingConstants& c, const WaterPreset& p
     c.depthFoamScroll = {ScrollOffset(seconds, 0, preset.depthFadeFoam[3]),
                          ScrollOffset(seconds, 1, preset.depthFadeFoam[3]), 0.0f, 0.0f};
     c.reflectionFog = m_reflectionFog;
-    const float packedUnit = kWaterMaxViewDepth / kPackedDepthLevels * kByteMax;
-    c.depthDecode = m_packedDepth ? Float4{packedUnit * kHighByteWeight, packedUnit * kMidByteWeight, packedUnit, 0.0f}
-                                  : Float4{1.0f, 0.0f, 0.0f, 0.0f};
+    c.depthDecode = CopiedDepthDecode();
     c.rippleWindow = m_rippleWindow;
     c.rippleShape = m_rippleShape;
     c.rippleFade = m_rippleFade;
+    FillFallFoam(c, m_in, seconds);
+    FillLips(c, m_in, seconds);
+    // Surf at the coast: the ocean pass only (vw_surface.hlsli CoastSurf).
+    c.coast = {waterClass == WaterClass::Ocean ? kCoastSurfStrength : 0.0f,
+               static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)), 0.0f, 0.0f};
+    const WaterContactFrame& seen = m_water.contacts;
+    const uint32_t lamps = m_cfg.localLights ? std::min(m_in.localLights.pointLightCount, kMaxLocalPointLights) : 0u;
+    c.lampControl = {static_cast<float>(lamps), kLampStrength, 0.0f, 0.0f};
+    for (uint32_t i = 0; i < kMaxLocalPointLights; ++i)
+    {
+        const LocalPointLight& lamp = m_in.localLights.pointLights[i];
+        const bool on = i < lamps;
+        c.lampPosition[i] = on ? Float4{lamp.position[0], lamp.position[1], lamp.position[2], lamp.cutoff} : Float4{};
+        c.lampColour[i] = on ? Float4{lamp.uploadedColor[0], lamp.uploadedColor[1], lamp.uploadedColor[2], 0.0f} : Float4{};
+        c.lampFalloff[i] = on ? Float4{lamp.attenuation[0], lamp.attenuation[1], lamp.attenuation[2], 0.0f} : Float4{};
+    }
+    c.player = seen.hasPlayer ? Float4{seen.player[0], seen.player[1], seen.player[2],
+                                       seen.playerMounted ? kMountedReflectionReach : kPlayerReflectionReach}
+                              : Float4{};
+    c.rainControl = {m_cfg.waterRainRipples * water_rain::Intensity(),
+                     static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)),
+                     m_cfg.waterRainSize, m_cfg.waterRainDistance};
     for (int slot = 0; slot < kWaterShadedMaskSlots; ++slot)
     {
         const int32_t mask = preset.masks[slot];
@@ -1365,13 +1682,31 @@ void WaterRenderer::ShadeClasses(IDirect3DDevice9* dev, IDirect3DSurface9* targe
     m_shadingVariant = g_forcedShadingVariant >= 0 && g_forcedShadingVariant < kWaterQualityLevels
                            ? g_forcedShadingVariant
                            : ShadingVariant(m_cfg);
-    dev->SetPixelShader(m_shade[m_shadingVariant]);
+    // With this frame's player mask in the scene depth copy, the variant that looks past the player by it.
+    IDirect3DPixelShader9* masked = m_playerMaskCopied ? m_shadeMasked[m_shadingVariant] : nullptr;
+    dev->SetPixelShader(masked ? masked : m_shade[m_shadingVariant]);
     dev->SetPixelShaderConstantF(0, &m_common[0][0], kCommonConstants);
     BindPointSampler(dev, kSceneColourStage, m_sceneColour, D3DTADDRESS_MIRROR);
     BindPointSampler(dev, kSceneDepthStage, m_sceneDepth, D3DTADDRESS_MIRROR);
     BindPointSampler(dev, kWaterDepthStage, m_waterDepth, D3DTADDRESS_CLAMP);
     BindSampler(dev, kRippleStage, m_ripplesShaded ? m_ripples.Map() : m_flat, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
                 D3DTEXF_NONE);
+    // The current around the player (water_flow.h), rebuilt as they move.
+    const bool riverFlow = m_cfg.waterRiverFlow && m_riverFlow.Update(dev, m_in.mapId, RippleFocus());
+    Float4 riverFlowMap = {};
+    if (riverFlow)
+        m_riverFlow.Mapping(&riverFlowMap.x);
+    BindSampler(dev, kRiverFlowStage, riverFlow ? m_riverFlow.Texture() : m_flat, D3DTADDRESS_CLAMP, D3DTEXF_LINEAR,
+                D3DTEXF_NONE);
+    // The floor under the player's body (water_floor.h), refitted as they move: their reach, as the shader's BodyRadius.
+    {
+        const WaterContactFrame& seen = m_water.contacts;
+        m_floor.Update(seen.hasPlayer, seen.player, seen.playerMounted ? kMountedReflectionReach : kBodyReach, seconds);
+        m_floorWide.Update(seen.hasPlayer, seen.player, water_floor::kWideReach, seconds);
+    }
+    Float4 floorFit[3] = {}, floorWide[3] = {};
+    m_floor.Constants(&floorFit[0].x, &floorFit[1].x, &floorFit[2].x);
+    m_floorWide.Constants(&floorWide[0].x, &floorWide[1].x, &floorWide[2].x);
     const WaterData& data = GlobalWaterData();
     static_assert(sizeof(ShadingConstants) % sizeof(Float4) == 0, "water constants are whole registers");
     static_assert(kShadingFirstConstant + sizeof(ShadingConstants) / sizeof(Float4) <= kWaterPixelConstants,
@@ -1384,6 +1719,15 @@ void WaterRenderer::ShadeClasses(IDirect3DDevice9* dev, IDirect3DSurface9* targe
             continue;
         ShadingConstants constants;
         FillClassConstants(constants, *preset, waterClass, seconds);
+        constants.riverFlowMap = riverFlowMap;
+        constants.riverFlowControl = {static_cast<float>(std::fmod(std::max(seconds + RiverClockOffset(), 0.0), 256.0)),
+                                      0.0f, 0.0f, 0.0f};
+        constants.floorFit0 = floorFit[0];
+        constants.floorFit1 = floorFit[1];
+        constants.floorFit2 = floorFit[2];
+        constants.floorWide0 = floorWide[0];
+        constants.floorWide1 = floorWide[1];
+        constants.floorWide2 = floorWide[2];
         dev->SetPixelShaderConstantF(kShadingFirstConstant, &constants.light.x,
                                      sizeof(constants) / sizeof(Float4));
         BindClassTextures(dev, *preset);
@@ -1392,6 +1736,65 @@ void WaterRenderer::ShadeClasses(IDirect3DDevice9* dev, IDirect3DSurface9* targe
         ++m_shadedClasses;
         m_shadedClassMask |= 1u << index;
     }
+}
+
+// The linear depth copies' decode: R32F as is, or packed bytes.
+WaterRenderer::Float4 WaterRenderer::CopiedDepthDecode() const
+{
+    const float packedUnit = kWaterMaxViewDepth / kPackedDepthLevels * kByteMax;
+    return m_packedDepth ? Float4{packedUnit * kHighByteWeight, packedUnit * kMidByteWeight, packedUnit, 0.0f}
+                         : Float4{1.0f, 0.0f, 0.0f, 0.0f};
+}
+
+// After shading, every tagged water pixel's depth moves kWaterDepthPushYards straight down (vw_depth_push.hlsl),
+// from the water's linear depth copy; colour is left alone. Runs with ShadeClasses' targets and stencil.
+void WaterRenderer::PushWaterDepth(IDirect3DDevice9* dev)
+{
+    if (!m_depthPush || !m_waterDepth)
+        return;
+    dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
+    dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+    dev->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_NOTEQUAL);
+    dev->SetRenderState(D3DRS_STENCILREF, kUntaggedStencil);
+    dev->SetRenderState(D3DRS_STENCILMASK, kStencilAllBits);
+    dev->SetRenderState(D3DRS_STENCILWRITEMASK, 0);
+    dev->SetRenderState(D3DRS_ZENABLE, D3DZB_TRUE);
+    dev->SetRenderState(D3DRS_ZFUNC, D3DCMP_ALWAYS);
+    dev->SetRenderState(D3DRS_ZWRITEENABLE, TRUE);
+    dev->SetPixelShader(m_depthPush);
+    dev->SetPixelShaderConstantF(0, &m_common[0][0], kCommonConstants);
+    const Float4 decode = CopiedDepthDecode();
+    // The falls nearby (as their foam finds them), each fall's lip: the top edge of its box.
+    float lips[kMaxPushLips * 8] = {};
+    uint32_t lipCount = 0;
+    {
+        const WaterfallEmitter* falls[kMaxActiveWaterfalls];
+        const float* focus = RippleFocus();
+        const uint32_t count =
+            CollectWaterfalls(m_in.mapId, focus, focus[2], kWaterfallFoamRange, falls, kMaxActiveWaterfalls);
+        for (uint32_t i = 0; i < count && lipCount < kMaxPushLips; ++i)
+        {
+            const WaterfallEmitter& e = *falls[i];
+            if (e.kind != kWaterfallFall || e.height < kLipPushMinHeight)
+                continue;
+            float* l = lips + lipCount * 8;
+            l[0] = e.a[0];
+            l[1] = e.a[1];
+            l[2] = e.a[2] + e.height;
+            l[3] = 0.5f * e.thickness + kLipReachYards;
+            l[4] = e.b[0];
+            l[5] = e.b[1];
+            l[6] = e.b[2] + e.height;
+            l[7] = std::min(e.height, kLipPushMaxYards);
+            ++lipCount;
+        }
+    }
+    const float push[4] = {kWaterDepthPushYards, kWaterDepthPushMaxViewYards, static_cast<float>(lipCount), 0.0f};
+    dev->SetPixelShaderConstantF(kCommonConstants, &decode.x, 1);
+    dev->SetPixelShaderConstantF(kCommonConstants + 1, push, 1);
+    dev->SetPixelShaderConstantF(kCommonConstants + 2, lips, kMaxPushLips * 2);
+    BindPointSampler(dev, 0, m_waterDepth, D3DTADDRESS_CLAMP);
+    DrawFullscreenTriangle(dev);
 }
 
 bool WaterRenderer::End(IDirect3DDevice9* dev, const SceneDepth& depth)
@@ -1457,14 +1860,49 @@ void WaterRenderer::LogSummaryWhenDue(IDirect3DDevice9* dev)
                       m_summaryDroppedSteps);
     else if (m_cfg.waterRipples > 0.0f)
         std::snprintf(ripples, sizeof(ripples), "idle, up to %u contacts", m_summaryContacts);
-    VF_LOG_INFO("%s, classes %s, waves %s, ripples %s", gpu[0] ? gpu : "water gpu timing unavailable",
-                classes[0] ? classes : "none", waves, ripples);
+    char bobbers[kSummaryTextSize] = "";
+    const uint64_t bobberRipples = m_contacts.BobberRipplesTaken() - m_summaryBobberRipplesBase;
+    if (m_summaryFishingNodes || bobberRipples)
+        std::snprintf(bobbers, sizeof(bobbers), "; bobbers up to %u of %u fishing nodes (%u skipped), %llu rings",
+                      m_summaryBobbers, m_summaryFishingNodes, m_summaryRejectedNodes,
+                      static_cast<unsigned long long>(bobberRipples));
+    char schools[kSummaryTextSize] = "";
+    const uint64_t schoolRipples = m_contacts.SchoolRipplesTaken() - m_summarySchoolRipplesBase;
+    if (m_summarySchools || schoolRipples)
+        std::snprintf(schools, sizeof(schools), "; fish schools up to %u, %llu rings", m_summarySchools,
+                      static_cast<unsigned long long>(schoolRipples));
+    char waterfalls[kSummaryTextSize] = "";
+    if (m_summaryWaterfalls || m_summaryNearestFall < kWaterfallLogRange)
+        std::snprintf(waterfalls, sizeof(waterfalls), "; waterfalls up to %u, nearest %.0f yd away, %.0f yd below",
+                      m_summaryWaterfalls, m_summaryNearestFall, m_summaryNearestFallDrop);
+    // Water walking and restarts (a restart clears every ripple at once: after a gap over a second, a map change or
+    // the clock going back).
+    char walking[kSummaryTextSize] = "";
+    const uint64_t footsteps = m_contacts.Footsteps() - m_summaryFootstepsBase;
+    const uint64_t landings = m_contacts.Landings() - m_summaryLandingsBase;
+    const uint32_t restarts = m_rippleRestarts - m_summaryRestartsBase;
+    if (footsteps || landings || restarts)
+        std::snprintf(walking, sizeof(walking), "; water walking %llu footsteps, %llu landings; %u ripple restarts",
+                      static_cast<unsigned long long>(footsteps), static_cast<unsigned long long>(landings), restarts);
+    VF_LOG_INFO("%s, classes %s, waves %s, ripples %s%s%s%s%s", gpu[0] ? gpu : "water gpu timing unavailable",
+                classes[0] ? classes : "none", waves, ripples, bobbers, schools, waterfalls, walking);
+    m_summaryFootstepsBase = m_contacts.Footsteps();
+    m_summaryLandingsBase = m_contacts.Landings();
+    m_summaryRestartsBase = m_rippleRestarts;
+    m_summaryWaterfalls = 0;
+    m_summaryNearestFall = kWaterfallLogRange;
     m_summaryClasses = 0;
     m_summaryWaveResolution = 0;
     m_summaryWaveTiles = 0;
     m_summaryRippleTexels = 0;
     m_summaryContacts = 0;
     m_summaryDroppedSteps = 0;
+    m_summaryBobbers = 0;
+    m_summaryFishingNodes = 0;
+    m_summaryRejectedNodes = 0;
+    m_summaryBobberRipplesBase = m_contacts.BobberRipplesTaken();
+    m_summarySchools = 0;
+    m_summarySchoolRipplesBase = m_contacts.SchoolRipplesTaken();
 }
 
 bool WaterRenderer::ShadeTaggedWater(IDirect3DDevice9* dev, const SceneDepth& depth)
@@ -1512,6 +1950,7 @@ bool WaterRenderer::ShadeTaggedWater(IDirect3DDevice9* dev, const SceneDepth& de
     SetPassState(dev);
     CopyLinearDepth(dev, depth.texture, m_waterDepth);
     ShadeClasses(dev, m_saved.colour[0], depth.bound, seconds);
+    PushWaterDepth(dev);
     RestoreTargets(dev);
     LogWaveState();
     if (m_shadedClasses == 0)

@@ -8,6 +8,8 @@
 #include "water_contacts.h"
 #include "water_data.h"
 #include "water_fft.h"
+#include "water_floor.h"
+#include "water_flow.h"
 #include "water_ripples.h"
 #include "water_types.h"
 
@@ -33,6 +35,17 @@ void InjectWaterFault(WaterFaultStage stage);
 void FailWaterMaskUploads(int count);
 void ForceWaterShadingVariant(int variant);
 void ForceWaterSummary();
+
+// One scattering colour (linear rgb) from the preset's and the zone's: the zone lends its hue at the preset's
+// brightness, blended in by `weight` (WaterZoneColors). A black zone colour leaves the preset's.
+void ZoneTintedColour(const float* authored, const float* zone, float weight, float* out);
+
+// Absorption per yard (rgb) from the preset's and the zone's colour and opacity: what 3 yards of water leave of the
+// light behind it takes the zone's hue and lets through 1 - `opacity` of it (the zone's waterShallowAlpha; negative:
+// as much as the preset does), the zone's coefficients scaled by `clarityGain`; blended in by `weight`. A black zone
+// colour leaves the preset's.
+void ZoneTintedAbsorption(const float* presetPerYard, const float* zone, float opacity, float clarityGain, float weight,
+                          float* out);
 
 constexpr int kWaterQualityLevels = 3;
 constexpr int kWaterSkyBands = 5;
@@ -120,6 +133,27 @@ private:
         Float4 rippleWindow;
         Float4 rippleShape;
         Float4 rippleFade;
+        Float4 rainControl;
+        Float4 fallFoamControl;                          // c69: count, strength, seconds mod 256
+        Float4 fallFoamSegments[kMaxActiveWaterfalls];   // c70: base a.xy, b.xy
+        Float4 fallFoamShape[kMaxActiveWaterfalls];      // c86: radius, strength, base height, height band
+        Float4 lipControl;                               // c102: count, strength, seconds mod 256
+        Float4 lipFrame[kMaxActiveLips];                 // c103: lip centre xy, flow direction zw
+        Float4 lipShape[kMaxActiveLips];                 // c111: half width at the lip, reach upstream, surface, strength
+        Float4 coast;                                    // c119: surf strength (ocean only), seconds mod 256
+        Float4 player;                                   // c120: the player's feet (world), reflection reach (0: none)
+        Float4 lampControl;                              // c121: count, strength
+        Float4 lampPosition[kMaxLocalPointLights];       // c122: world position, cutoff radius
+        Float4 lampColour[kMaxLocalPointLights];         // c130: colour as the client uploads it
+        Float4 lampFalloff[kMaxLocalPointLights];        // c138: attenuation (constant, linear, quadratic)
+        Float4 riverFlowMap;                             // c146: the current's texture (water_flow.h), w = on
+        Float4 riverFlowControl;                         // c147: seconds mod 256
+        Float4 floorFit0;                                // c148: the floor around the player (water_floor.h): a, b, c, on
+        Float4 floorFit1;                                // c149: d, e, f
+        Float4 floorFit2;                                // c150: the fit's centre (world x, y), half span
+        Float4 floorWide0;                               // c151: the same fitted wider (water_floor.h kWideReach)
+        Float4 floorWide1;                               // c152
+        Float4 floorWide2;                               // c153
     };
 
     struct FoamMaskTexture
@@ -157,7 +191,8 @@ private:
     void CaptureClientState();
     void RestoreTargets(IDirect3DDevice9* dev);
     void SetPassState(IDirect3DDevice9* dev);
-    void CopyLinearDepth(IDirect3DDevice9* dev, IDirect3DTexture9* depthTexture, IDirect3DTexture9* copy);
+    void CopyLinearDepth(IDirect3DDevice9* dev, IDirect3DTexture9* depthTexture, IDirect3DTexture9* copy,
+                         bool withPlayerMask = false);
     bool CopySceneColour(IDirect3DDevice9* dev, IDirect3DSurface9* target, const D3DVIEWPORT9& vp);
     void ClearWaterStencil(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DSurface9* depthSurface,
                            const D3DVIEWPORT9& vp);
@@ -171,13 +206,20 @@ private:
     void RestartRipples();
     void ReleaseRipples();
     bool SimulateRipples(IDirect3DDevice9* dev, double seconds);
+    const float* RippleFocus() const;
+    void RippleCentre(double seconds, int texels, float centre[2]);
+    void CollectRippleWaterfalls(const float centre[2], int texels);
     void FillRippleConstants(double seconds);
     void LogWaveState();
     void ShadeClasses(IDirect3DDevice9* dev, IDirect3DSurface9* target, IDirect3DSurface9* depthSurface,
                       double seconds);
     void BindClassTextures(IDirect3DDevice9* dev, const WaterPreset& preset);
+    void PushWaterDepth(IDirect3DDevice9* dev);
+    Float4 CopiedDepthDecode() const;
     void FillClassConstants(ShadingConstants& c, const WaterPreset& preset, WaterClass waterClass,
                             double seconds) const;
+    void FillFallFoam(ShadingConstants& c, const FrameInputs& in, double seconds) const;
+    void FillLips(ShadingConstants& c, const FrameInputs& in, double seconds) const;
     bool ShadeTaggedWater(IDirect3DDevice9* dev, const SceneDepth& depth);
     void BuildReflectionFog();
     void AddToSummary(bool shaded);
@@ -187,7 +229,11 @@ private:
     IDirect3DVertexDeclaration9* m_decl = nullptr;
     IDirect3DPixelShader9* m_depthCopy = nullptr;
     IDirect3DPixelShader9* m_packedDepthCopy = nullptr;
+    IDirect3DPixelShader9* m_depthPush = nullptr;
     IDirect3DPixelShader9* m_shade[kWaterQualityLevels] = {};
+    // The same with the exact player mask (vw_reflection.hlsli PLAYER_MASK), for passes whose scene depth copy carries
+    // it; none for the lowest level (no reflections traced).
+    IDirect3DPixelShader9* m_shadeMasked[kWaterQualityLevels] = {};
     IDirect3DDevice9* m_unsupportedShaderDevice = nullptr;
     IDirect3DStateBlock9* m_state = nullptr;
     IDirect3DTexture9* m_sceneColour = nullptr;
@@ -205,11 +251,14 @@ private:
     UINT m_copyW = 0;
     UINT m_copyH = 0;
     bool m_packedDepth = false;
+    bool m_maskInDepth = false;        // m_sceneDepth is G32R32F: g holds the player mask (player_mask.h)
+    bool m_playerMaskCopied = false;   // this pass's scene depth copy carries this frame's player mask
     bool m_packedDepthForcedCopies = false;
     bool m_copyFailed = false;
     UINT m_loggedCopyW = 0;
     UINT m_loggedCopyH = 0;
     bool m_loggedPackedDepth = false;
+    bool m_loggedMaskInDepth = false;
 
     SavedTargets m_saved;
     bool m_stateCaptured = false;
@@ -237,11 +286,30 @@ private:
     int m_summaryRippleTexels = 0;
     uint32_t m_summaryContacts = 0;
     uint32_t m_summaryDroppedSteps = 0;
+    float m_rippleBias[2] = {};
+    double m_lastBiasSeconds = -1.0;
+    uint32_t m_summaryWaterfalls = 0;
+    static constexpr float kWaterfallLogRange = 60.0f;
+    float m_summaryNearestFall = kWaterfallLogRange;
+    float m_summaryNearestFallDrop = 0.0f;
+    int m_loggedWaterfallMap = -1;
+    uint32_t m_summaryBobbers = 0;
+    uint32_t m_summaryFishingNodes = 0;
+    uint32_t m_summaryRejectedNodes = 0;
+    uint64_t m_summaryBobberRipplesBase = 0;
+    uint32_t m_summarySchools = 0;
+    uint64_t m_summarySchoolRipplesBase = 0;
+    uint64_t m_summaryFootstepsBase = 0;
+    uint64_t m_summaryLandingsBase = 0;
+    uint32_t m_summaryRestartsBase = 0;
     double m_lastSeconds = -1.0;
     double m_lastWaveSeconds = -1.0;
     double m_lastFrameSeconds = -1.0;
     bool m_wavesValid = false;
     WaterRipples m_ripples;
+    RiverFlowTexture m_riverFlow;
+    water_floor::FloorFitter m_floor;
+    water_floor::FloorFitter m_floorWide;
     WaterContactTracker m_contacts;
     Float4 m_rippleWindow = {};
     Float4 m_rippleShape = {};

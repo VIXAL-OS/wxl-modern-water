@@ -26,7 +26,7 @@ set(VOLFOG_VF_INCLUDES ${VOLFOG_SHADER_DIR}/vf_common.hlsli ${VOLFOG_SHADER_DIR}
 set(VOLFOG_VW_FFT_INCLUDES ${VOLFOG_SHADER_DIR}/vw_fft_common.hlsli)
 set(VOLFOG_VW_INCLUDES ${VOLFOG_SHADER_DIR}/vf_common.hlsli ${VOLFOG_SHADER_DIR}/vw_constants.hlsli
     ${VOLFOG_SHADER_DIR}/vw_surface.hlsli ${VOLFOG_SHADER_DIR}/vw_optics.hlsli
-    ${VOLFOG_SHADER_DIR}/vw_reflection.hlsli)
+    ${VOLFOG_SHADER_DIR}/vw_reflection.hlsli ${VOLFOG_SHADER_DIR}/vw_rain.hlsli)
 
 function(volfog_shader name source profile)
     if(source MATCHES "^vw_fft_")
@@ -106,9 +106,12 @@ volfog_shader(ps_vw_fft_mip_pair vw_fft_mip.hlsl ps_3_0 /DPAIRED=1)
 
 volfog_shader(ps_vw_depth vw_linear_depth.hlsl ps_3_0 /DPACKED_DEPTH=0)
 volfog_shader(ps_vw_depth_packed vw_linear_depth.hlsl ps_3_0 /DPACKED_DEPTH=1)
+volfog_shader(ps_vw_depth_push vw_depth_push.hlsl ps_3_0)
 volfog_shader(ps_vw_shade_low vw_water.hlsl ps_3_0 /DSSR_STEPS=0)
 volfog_shader(ps_vw_shade_mid vw_water.hlsl ps_3_0 /DSSR_STEPS=8)
 volfog_shader(ps_vw_shade_high vw_water.hlsl ps_3_0 /DSSR_STEPS=16)
+volfog_shader(ps_vw_shade_mid_mask vw_water.hlsl ps_3_0 /DSSR_STEPS=8 /DPLAYER_MASK=1)
+volfog_shader(ps_vw_shade_high_mask vw_water.hlsl ps_3_0 /DSSR_STEPS=16 /DPLAYER_MASK=1)
 volfog_shader(ps_vw_ripple_step vw_ripple_step.hlsl ps_3_0)
 
 add_custom_target(${wxl_ext_name}_shaders DEPENDS ${VOLFOG_SHADER_HEADERS})

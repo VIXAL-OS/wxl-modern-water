@@ -43,6 +43,10 @@ struct WaterInputs
     uint32_t skyColors[kSkyColorCount];
     uint32_t riverColors[kWaterColorPair];
     uint32_t oceanColors[kWaterColorPair];
+    // The zone's own water opacity (LightParams waterShallowAlpha / waterDeepAlpha, as the client blends them for
+    // the camera's place and time); valid only when the client code that stores them matched.
+    float waterAlpha[kWaterColorPair];
+    bool waterAlphaValid;
     bool stockFogApplies;
     WaterContactFrame contacts;
 };

@@ -71,8 +71,10 @@ public:
     bool Supported(IDirect3DDevice9* dev);
     bool Prepare(IDirect3DDevice9* dev, int texels);
     WaterRippleSchedule Schedule(double seconds);
+    // `flow`: the current's texture around the player (water_flow.h) and its mapping (RiverFlowTexture::Mapping),
+    // or nullptr for still water everywhere.
     void Step(IDirect3DDevice9* dev, const float centre[2], const WaterRippleDisturbance* disturbances,
-              uint32_t count);
+              uint32_t count, IDirect3DTexture9* flow = nullptr, const float* flowMapping = nullptr);
 
     bool Running() const { return m_running; }
     bool Visible() const { return m_running && m_mapsCleared; }
