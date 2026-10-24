@@ -65,11 +65,14 @@ constexpr double kRippleBiasMaxStepSeconds = 0.25;
 // Another player's far bobber doesn't pull the window while the player is touching the water (a unit in the
 // water this close to the camera target): the player's own ripples come first.
 constexpr float kRippleSelfContactYards = 2.5f;
-// Once shaded, the water's depth moves this far straight down (vw_depth_push.hlsl), so models made to lie on the
-// water or just under it (a fountain's foam sheet 4 cm down, splash decals) draw over it as over the client's own
-// water; at a grazing view the move along the view is capped.
-constexpr float kWaterDepthPushYards = 0.1f;
-constexpr float kWaterDepthPushMaxViewYards = 1.0f;
+// Once shaded, the water's depth moves this far straight down (vw_depth_push.hlsl), but never past the scene behind
+// it, so models made to lie on the water or just under it draw over it as over the client's own water: a fountain's
+// foam sheet 4 cm down, splash decals, and the foam and ripple sheets laid on rivers at falls. Those sit up to 0.37 yd
+// under (whole sheets, in a scan of every placed fall model against its map's liquid); the Sholazar fall's foam on the
+// Frenzyheart River 0.08 to 0.16 yd, which a tenth of a yard cut into flickering slabs (the user, 2026-10-16 and
+// 2026-10-24). At a grazing view the move along the view is capped (ten times the push, as before).
+constexpr float kWaterDepthPushYards = 0.5f;
+constexpr float kWaterDepthPushMaxViewYards = 5.0f;
 // At the lips of the falls nearby (vw_depth_push.hlsl cLip): the river's surface overhangs the edge, so there the water
 // moves down by the fall's height (at most kLipPushMaxYards) within kLipReachYards of the box's top edge beyond half its
 // thickness, for falls at least kLipPushMinHeight tall.
@@ -1747,10 +1750,11 @@ WaterRenderer::Float4 WaterRenderer::CopiedDepthDecode() const
 }
 
 // After shading, every tagged water pixel's depth moves kWaterDepthPushYards straight down (vw_depth_push.hlsl),
-// from the water's linear depth copy; colour is left alone. Runs with ShadeClasses' targets and stencil.
+// from the water's linear depth copy, and no further than the scene's copy from before the water; colour is left
+// alone. Runs with ShadeClasses' targets and stencil.
 void WaterRenderer::PushWaterDepth(IDirect3DDevice9* dev)
 {
-    if (!m_depthPush || !m_waterDepth)
+    if (!m_depthPush || !m_waterDepth || !m_sceneDepth)
         return;
     dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0);
     dev->SetRenderState(D3DRS_STENCILENABLE, TRUE);
@@ -1794,6 +1798,7 @@ void WaterRenderer::PushWaterDepth(IDirect3DDevice9* dev)
     dev->SetPixelShaderConstantF(kCommonConstants + 1, push, 1);
     dev->SetPixelShaderConstantF(kCommonConstants + 2, lips, kMaxPushLips * 2);
     BindPointSampler(dev, 0, m_waterDepth, D3DTADDRESS_CLAMP);
+    BindPointSampler(dev, 1, m_sceneDepth, D3DTADDRESS_CLAMP);
     DrawFullscreenTriangle(dev);
 }
 

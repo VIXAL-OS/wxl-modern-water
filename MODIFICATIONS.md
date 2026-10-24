@@ -4,13 +4,15 @@ This is a modified version of [wxl-modern-water](https://github.com/manatactical
 manatactical, licensed under GPL-3.0 (see [LICENSE](LICENSE)). The modifications are released under the same license.
 
 - **Who:** VIXAL-OS, with AI coding assistants (Claude and Codex).
-- **When:** 7–16 October 2026.
+- **When:** 7–24 October 2026.
 - **What it's based on:** the upstream 1.2 tag.
 - **Target:** the 3.3.5a client (build 12340), played on ChromieCraft.
 
 ## What changed
 - **Startup and visibility:** the world no longer goes invisible at login, water no longer disappears above its surface,
-  the device survives a reset, and the water's depth goes under the surface once shaded.
+  the device survives a reset, and the water's depth goes half a yard under the surface once shaded (never past the
+  ground or rock behind it), so the foam and ripple sheets the game lays just under its rivers and pools show whole
+  instead of in flickering slabs (the Frenzyheart River in Sholazar).
 - **Rain:** raindrops ring the water, driven by Seyris Living Azeroth's rain signal (`chromie.rain-signal` v1), with
   random placement and visible sizes.
 - **Interaction:**
