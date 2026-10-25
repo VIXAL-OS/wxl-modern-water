@@ -42,9 +42,12 @@ float4 cLipFrame[kMaxLips] : register(c103);  // lip centre xy, flow direction z
 float4 cLipShape[kMaxLips] : register(c111);  // half width at the lip, reach upstream, surface height, strength
 float4 cCoast : register(c119);               // surf strength (the ocean pass only), seconds mod 256
 float4 cPlayer : register(c120);              // the player's feet (world), reach of their reflection (0: none)
-// The client's point lights near the camera (lamps, torches), as the fog takes them: count, strength; per lamp its
-// world position and cutoff radius (yd), its colour as the client uploads it, and its attenuation (constant, linear,
-// quadratic).
+// The lamps near the camera that matter on the water (water_lamps.h: Living Azeroth's light list, else the client's
+// own point lights): count, the strength of their light on the water, the strength of their reflections, the smallest
+// roughness of their reflections (the unresolved ripples; 0 on flat water); per lamp its world position and the reach
+// of its light (yd), its colour (linear) and window (0: the client's, linear over the last quarter of the reach; above
+// 0: Living Azeroth's, ((1 - (d / reach)^2)^2)^this, the light a yard across), and its attenuation (constant, linear,
+// quadratic) and how far its reflection reaches (yd).
 static const int kMaxLamps = 8;
 float4 cLampControl : register(c121);
 float4 cLampPosition[kMaxLamps] : register(c122);
@@ -58,6 +61,12 @@ float4 cFloorFit2 : register(c150);         // (dx, dy) = position - xy; z = the
 float4 cFloorWide0 : register(c151);        // the same fitted wider (water_floor.h kWideReach)
 float4 cFloorWide1 : register(c152);
 float4 cFloorWide2 : register(c153);
+// Sun glitter (vw_optics.hlsli SunGlitter): strength (0: none; less in the rain), how far the facets tilt (more wind,
+// more), seconds mod 256, the finest sparkle cell (yd).
+float4 cGlitter : register(c154);
+// The reflections' trace (vw_reflection.hlsli): 1 = steady steps (fixed angles as seen from the camera, so a reflection
+// stays put as the camera turns), 0 = spread over the screen as before; the screen's height as an angle (radians).
+float4 cReflectionSteps : register(c155);
 
 sampler2D sSceneColour : register(s0);
 sampler2D sSceneDepth : register(s1);

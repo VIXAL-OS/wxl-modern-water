@@ -8,6 +8,7 @@
 #include "d3d9_wrap.h"
 #include "hooks.h"
 #include "msaa_depth.h"
+#include "water_lamps.h"
 #include "WaterRain.hpp"
 
 #include "wxl/PluginApi.h"
@@ -87,7 +88,19 @@ static void __cdecl DrawPanel(void*)
         p.Float("Wind", edited.waterWind, 0.5f, 10.0f);
         p.Float("Foam", edited.waterFoam, 0.0f, 2.0f);
         p.Float("Reflections", edited.waterReflections, 0.0f, 2.0f);
+        p.Check("Steady reflections (stay put as you turn)", edited.waterSteadyReflections);
         p.Float("Sun highlight", edited.waterSpecular, 0.0f, 4.0f);
+        p.Float("Sun glitter", edited.waterGlitter, 0.0f, 2.0f);
+        p.Float("Lamps on the water", edited.waterLamps, 0.0f, 2.0f);
+        const WaterLampsStatus lamps = LastWaterLampsStatus();
+        if (edited.waterLamps <= 0.0f)
+            std::snprintf(line, sizeof(line), "Lamps on the water: off");
+        else if (lamps.source == WaterLampSource::None)
+            std::snprintf(line, sizeof(line), "Lamps on the water: none near");
+        else
+            std::snprintf(line, sizeof(line), "Lamps on the water: %u of %u from %s", lamps.count, lamps.offered,
+                          WaterLampSourceName(lamps.source));
+        api.UiText(line);
         p.Float("Clarity", edited.waterClarity, 0.25f, 4.0f);
         p.Float("Zone colours", edited.waterZoneColors, 0.0f, 1.0f);
         p.Float("Ripples", edited.waterRipples, 0.0f, 2.0f);

@@ -10,6 +10,7 @@
 #include "log.h"
 #include "player_mask.h"
 #include "water_data.h"
+#include "WaterLights.hpp"
 #include "WaterRain.hpp"
 
 #include "WxlOverlay.hpp"
@@ -126,6 +127,7 @@ extern "C" __declspec(dllexport) int __cdecl WXL_Load(const WXL_Api* api)
     if (!api || api->apiVersion != WXL_API_VERSION) return 0;
     g_api = api;
     water_rain::Init(api);
+    water_lights::Init(api);
     api->Subscribe(static_cast<uint32_t>(wxl::events::Event::OnDeviceLost), &OnDeviceLost, nullptr);
     api->Subscribe(static_cast<uint32_t>(wxl::events::Event::OnFrame), &OnFrame, nullptr);
     Attach();

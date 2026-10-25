@@ -4,7 +4,7 @@ This is a modified version of [wxl-modern-water](https://github.com/manatactical
 manatactical, licensed under GPL-3.0 (see [LICENSE](LICENSE)). The modifications are released under the same license.
 
 - **Who:** VIXAL-OS, with AI coding assistants (Claude and Codex).
-- **When:** 7–24 October 2026.
+- **When:** 7–25 October 2026.
 - **What it's based on:** the upstream 1.2 tag.
 - **Target:** the 3.3.5a client (build 12340), played on ChromieCraft.
 
@@ -32,10 +32,15 @@ manatactical, licensed under GPL-3.0 (see [LICENSE](LICENSE)). The modifications
 - **Looks:**
   - Absorption and murk.
   - Less green canal walls.
-  - Lamps lighting the water.
+  - Lamps on the water: their light, and their reflections as streaks running toward you, broken up by the waves.
+    The lights come from Seyris Living Azeroth's light list (`chromie.light-list` v1: lamps, torches, lit windows,
+    spell lights) when it publishes one, else from the client's own point lights, which the water now reads in game
+    (before, only the offline tests handed it any).
   - Refraction without moiré.
   - No shadow stripes on walls the light skims.
-  - Sun glint.
+  - Sun glint, and sun glitter: sparkles where the waves catch the sun for a moment, wider with more wind.
+  - Reflections stay put as the camera turns: the trace looks for what the water reflects at the same places in the
+    world whichever way the camera points (equal angles as seen from the camera), not at places spread over the screen.
   - Reflections no longer break around a hovering mount, and look through it (its see-through wings too) instead of
     falling back to the sky.
   - The exact player mask: the player's own batches (body, mount, gear) are drawn a second time into a mask carried

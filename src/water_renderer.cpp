@@ -25,7 +25,7 @@
 
 namespace
 {
-constexpr UINT kWaterPixelConstants = 154;
+constexpr UINT kWaterPixelConstants = 156;
 constexpr DWORD kWaterSamplerStages = 16;
 constexpr UINT kCommonConstants = 9;
 constexpr UINT kShadingFirstConstant = 9;
@@ -58,8 +58,20 @@ constexpr float kPlayerReflectionReach = 3.5f;
 constexpr float kMountedReflectionReach = 9.0f;
 // On foot the body's reach over the bed (vw_surface.hlsli kBodyRadius).
 constexpr float kBodyReach = 3.0f;
-// How strongly the client's point lights (lamps, torches) shine on the water (vw_optics.hlsli LampsOnWater), 0 = off.
+// How strongly the lamps (water_lamps.h) shine on the water (vw_optics.hlsli LampsOnWater), x WaterLamps; 0 = off.
 constexpr float kLampStrength = 1.0f;
+// The smallest roughness of a lamp's reflection: the ripples too small for the wave maps stretch it into a streak. Full
+// from WaterWaves kLampRoughWaves up, none on flat water (a lamp shows as a small sharp spot there).
+constexpr float kLampRoughness = 0.45f;
+constexpr float kLampRoughWaves = 0.5f;
+// Sun glitter (vw_optics.hlsli SunGlitter): its finest cell (yd); how far its facets tilt, kGlitterTilt +
+// kGlitterTiltPerWind x WaterWind (0.17 at the default wind 3), half that on calm water; full from WaterWaves
+// kGlitterFullWaves up, none on flat water; kGlitterRainDim less in full rain.
+constexpr float kGlitterCell = 0.18f;
+constexpr float kGlitterTilt = 0.065f;
+constexpr float kGlitterTiltPerWind = 0.035f;
+constexpr float kGlitterFullWaves = 0.5f;
+constexpr float kGlitterRainDim = 0.85f;
 constexpr float kRippleBiasYardsPerSecond = 40.0f;
 constexpr double kRippleBiasMaxStepSeconds = 0.25;
 // Another player's far bobber doesn't pull the window while the player is touching the water (a unit in the
@@ -1131,6 +1143,7 @@ bool WaterRenderer::Begin(IDirect3DDevice9* dev, const SceneDepth& depth, const 
     m_in = in;
     m_water = water;
     m_cfg = cfg;
+    ChooseWaterLamps(in, m_lamps);
     std::fill(std::begin(m_draws), std::end(m_draws), 0u);
     m_armed = true;
     return true;
@@ -1573,16 +1586,30 @@ void WaterRenderer::FillClassConstants(ShadingConstants& c, const WaterPreset& p
     c.coast = {waterClass == WaterClass::Ocean ? kCoastSurfStrength : 0.0f,
                static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)), 0.0f, 0.0f};
     const WaterContactFrame& seen = m_water.contacts;
-    const uint32_t lamps = m_cfg.localLights ? std::min(m_in.localLights.pointLightCount, kMaxLocalPointLights) : 0u;
-    c.lampControl = {static_cast<float>(lamps), kLampStrength, 0.0f, 0.0f};
-    for (uint32_t i = 0; i < kMaxLocalPointLights; ++i)
+    const float lampStrength = std::max(m_cfg.waterLamps, 0.0f);
+    const uint32_t lamps = lampStrength > 0.0f ? std::min(m_lamps.count, kMaxWaterLamps) : 0u;
+    c.lampControl = {static_cast<float>(lamps), kLampStrength * lampStrength, lampStrength,
+                     kLampRoughness * std::clamp(m_cfg.waterWaves / kLampRoughWaves, 0.0f, 1.0f)};
+    for (uint32_t i = 0; i < kMaxWaterLamps; ++i)
     {
-        const LocalPointLight& lamp = m_in.localLights.pointLights[i];
+        const WaterLamp& lamp = m_lamps.lamp[i];
         const bool on = i < lamps;
-        c.lampPosition[i] = on ? Float4{lamp.position[0], lamp.position[1], lamp.position[2], lamp.cutoff} : Float4{};
-        c.lampColour[i] = on ? Float4{lamp.uploadedColor[0], lamp.uploadedColor[1], lamp.uploadedColor[2], 0.0f} : Float4{};
-        c.lampFalloff[i] = on ? Float4{lamp.attenuation[0], lamp.attenuation[1], lamp.attenuation[2], 0.0f} : Float4{};
+        c.lampPosition[i] = on ? Float4{lamp.position[0], lamp.position[1], lamp.position[2], lamp.reach} : Float4{};
+        c.lampColour[i] = on ? Float4{lamp.colour[0], lamp.colour[1], lamp.colour[2], lamp.shape} : Float4{};
+        c.lampFalloff[i] = on ? Float4{lamp.falloff[0], lamp.falloff[1], lamp.falloff[2], lamp.mirrorReach} : Float4{};
     }
+    // Sun glitter: the facets tilt further with more wind; none on flat water, less in the rain (its rings break the
+    // surface and the sun is behind clouds).
+    const float rain = water_rain::Intensity();
+    const float waves = std::clamp(m_cfg.waterWaves / kGlitterFullWaves, 0.0f, 1.0f);
+    c.glitter = {std::max(m_cfg.waterGlitter, 0.0f) * waves * (1.0f - kGlitterRainDim * rain),
+                 (kGlitterTilt + kGlitterTiltPerWind * m_cfg.waterWind) * (0.5f + 0.5f * waves),
+                 static_cast<float>(std::fmod(std::max(seconds, 0.0), 256.0)), kGlitterCell};
+    // The steady steps reach over the screen's height (as an angle) at most.
+    const float cotHalfHeight = std::fabs(m_in.glProjection[5]);
+    c.reflectionSteps = {m_cfg.waterSteadyReflections ? 1.0f : 0.0f,
+                         cotHalfHeight > 1e-3f ? std::clamp(2.0f * std::atan(1.0f / cotHalfHeight), 0.2f, 3.0f) : 1.0f,
+                         0.0f, 0.0f};
     c.player = seen.hasPlayer ? Float4{seen.player[0], seen.player[1], seen.player[2],
                                        seen.playerMounted ? kMountedReflectionReach : kPlayerReflectionReach}
                               : Float4{};

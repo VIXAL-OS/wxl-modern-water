@@ -82,16 +82,13 @@ float4 main(float2 pixelIndex : VPOS) : COLOR0
     float3 R = ReflectedDirection(V, N);
     float2 hitUv;
     float4 screenReflection = TraceScreenReflection(w, pixel, R, hitUv);
-    float3 sky = 0;
-    [branch] if (screenReflection.a < 1)
-        sky = FoggedSkyReflection(w, R, SkyColour(R.z));
-    [branch] if (screenReflection.a > 0)
-        screenReflection.rgb = FoggedScreenReflection(w, R, screenReflection.rgb, hitUv);
-    float3 reflected = lerp(sky, screenReflection.rgb, screenReflection.a);
+    float3 reflected = FoggedReflection(w, R, lerp(SkyColour(R.z), screenReflection.rgb, screenReflection.a),
+                                        screenReflection.a, hitUv);
     float3 environment = reflected * EnvironmentBrdf(envRoughness, NoV) * ReflectionStrength();
     float3 H = normalize(V + L);
     float environmentAttenuation = 1 - FresnelSchlick(dot(H, V)) * SunVisibility();
     float3 sunSpecular = SunVisibility() * SunColour() * SpecularStrength() * SunGlint(sunRoughness, N, V, L);
+    sunSpecular += SpecularStrength() * SunGlitter(w, N, V, L, CrestTilt(waves.moments), foamAlbedo.a);
     colour += sunSpecular + environmentAttenuation * environment;
     LampLight lamps = LampsOnWater(w, N, V, sunRoughness);
     float3 underSurface = (1 - transmittance) * kLampScatter * lerp(TroughScatteringColour(), CrestScatteringColour(), kCrestColourBlend);

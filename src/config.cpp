@@ -90,6 +90,8 @@ const FloatSetting kWaterFloatSettings[] = {
     {"WaterRainRipples", &Config::waterRainRipples, 0.0f, 2.0f},
     {"WaterRainSize", &Config::waterRainSize, 0.5f, 3.0f},
     {"WaterRainDistance", &Config::waterRainDistance, 24.0f, 160.0f},
+    {"WaterGlitter", &Config::waterGlitter, 0.0f, 2.0f},
+    {"WaterLamps", &Config::waterLamps, 0.0f, 2.0f},
     {"ShadowSlopeBias", &Config::shadowSlopeBias, 0.0f, 8.0f},
     {"ShadowDepthBias", &Config::shadowDepthBias, 0.0f, 0.002f},
 };
@@ -105,6 +107,7 @@ const BoolSetting kBoolSettings[] = {
 const BoolSetting kWaterBoolSettings[] = {
     {"WaterClientSplashes", &Config::waterClientSplashes},
     {"WaterRiverFlow", &Config::waterRiverFlow},
+    {"WaterSteadyReflections", &Config::waterSteadyReflections},
 };
 
 template <typename Visit>

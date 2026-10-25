@@ -11,6 +11,7 @@
 #include "water_classify.h"
 #include "water_renderer.h"
 #include "status_log.h"
+#include "WaterLights.hpp"
 
 #include <windows.h>
 
@@ -427,9 +428,14 @@ struct WaterClient
     WaterClass (*classify)(const void* liquidSettings);
 };
 
+// The client's point lights are read for the water too (water_lamps.h) while it shows lamps and Living Azeroth isn't
+// publishing its own list. They never were: the water's frame inputs were built without them, so the lamps on the
+// water (vw_optics.hlsli LampsOnWater, 2026-10-11) only ever lit the offline tests, which hand them in directly.
+// Linear colours at full strength, as the water shades in linear light.
 bool GameWaterFrameInputs(FrameInputs& in)
 {
-    if (!engine::BuildFrameInputs(in, false, {}))
+    const bool clientLamps = GlobalConfig().Get().waterLamps > 0.0f && !water_lights::HasLights();
+    if (!engine::BuildFrameInputs(in, clientLamps, PointLightUpload{true, 1.0f}))
         return false;
     if (g_stockFogPushed)
         UseClientFogRangeInsteadOfPushed(in);

@@ -10,6 +10,7 @@
 #include "water_fft.h"
 #include "water_floor.h"
 #include "water_flow.h"
+#include "water_lamps.h"
 #include "water_ripples.h"
 #include "water_types.h"
 
@@ -142,10 +143,10 @@ private:
         Float4 lipShape[kMaxActiveLips];                 // c111: half width at the lip, reach upstream, surface, strength
         Float4 coast;                                    // c119: surf strength (ocean only), seconds mod 256
         Float4 player;                                   // c120: the player's feet (world), reflection reach (0: none)
-        Float4 lampControl;                              // c121: count, strength
-        Float4 lampPosition[kMaxLocalPointLights];       // c122: world position, cutoff radius
-        Float4 lampColour[kMaxLocalPointLights];         // c130: colour as the client uploads it
-        Float4 lampFalloff[kMaxLocalPointLights];        // c138: attenuation (constant, linear, quadratic)
+        Float4 lampControl;                              // c121: count, light and reflection strengths, roughness floor
+        Float4 lampPosition[kMaxWaterLamps];             // c122: world position, reach of its light
+        Float4 lampColour[kMaxWaterLamps];               // c130: colour (linear), window shape (0: the client's)
+        Float4 lampFalloff[kMaxWaterLamps];              // c138: attenuation (constant, linear, quadratic), mirror reach
         Float4 riverFlowMap;                             // c146: the current's texture (water_flow.h), w = on
         Float4 riverFlowControl;                         // c147: seconds mod 256
         Float4 floorFit0;                                // c148: the floor around the player (water_floor.h): a, b, c, on
@@ -154,6 +155,8 @@ private:
         Float4 floorWide0;                               // c151: the same fitted wider (water_floor.h kWideReach)
         Float4 floorWide1;                               // c152
         Float4 floorWide2;                               // c153
+        Float4 glitter;                                  // c154: strength, facet tilt, seconds mod 256, finest cell
+        Float4 reflectionSteps;                          // c155: steady (1/0), the screen's height as an angle
     };
 
     struct FoamMaskTexture
@@ -265,6 +268,7 @@ private:
     FrameInputs m_in = {};
     WaterInputs m_water = {};
     Config m_cfg;
+    WaterLamps m_lamps;   // this pass's (water_lamps.h)
     float m_common[9][4] = {};
     ReflectionFog m_reflectionFog = {};
     DWORD m_clientStencil[kWaterStencilStates] = {};

@@ -116,12 +116,19 @@ float SunGlint(float roughness, float3 N, float3 V, float3 L);
 // --- Lamps on the water --------------------------------------------------------------------------------------------
 // At night the water had only the sun, the moon and the sky: in Stormwind the lamp-lit walls glowed beside canals gone
 // nearly black ("am i tripping or are the sw canals super dark now? maybe just bc it's night?", the user, 2026-10-11).
-// The client's point lights near the camera (the ones the fog takes) now shine on it too: each one's glint, broken up
-// by the ripples like the sun's, and its light on the foam and in the water just under the surface. Their light falls
-// off as the client's does (1 / (constant + linear d + quadratic d^2)), fading out over the last kLampFadeShare of its
-// cutoff; a lamp below the surface gives none.
+// The lamps near the camera (water_lamps.h: Living Azeroth's light list -- lamps, torches, lit windows, spells -- or the
+// client's own point lights) shine on it: each one's reflection, broken up by the waves and ripples like the sun's into
+// a streak running toward the eye, and its light on the foam and in the water just under the surface. Their light
+// falls off as the client's does (1 / (constant + linear d + quadratic d^2)); on the water it ends at the light's reach
+// (the client's lights fade over the last kLampFadeShare of it, Living Azeroth's as its own shaders do). What the water
+// mirrors of a lamp is the lamp itself, seen in the water: it reaches further (cLampFalloff.w) and falls off as the
+// light would over kLampMirrorShrink of the distance, so a lamp across a canal still streaks the water in front of you
+// (lit at the full distance it was a short dim stub by the lamp's foot). The waves the maps don't resolve make a
+// lamp's streak long: on wavy water its lobe is never smoother than cLampControl.w (water_renderer.cpp
+// kLampRoughness, none on flat water, where a lamp shows as a small sharp spot). A lamp below the surface gives none.
 static const float kLampFadeShare = 0.25;
 static const float kLampScatter = 0.35;   // of its light scattered back out of the water just under the surface
+static const float kLampMirrorShrink = 0.35;
 
 struct LampLight
 {
@@ -138,22 +145,75 @@ LampLight LampsOnWater(WaterPixel w, float3 N, float3 V, float roughness)
         [branch] if (i >= count)
             break;
         float3 toLamp = cLampPosition[i].xyz - w.position;
-        float d = length(toLamp);
-        float cutoff = cLampPosition[i].w;
-        [branch] if (d < cutoff && d > 1e-3)
+        float d2 = dot(toLamp, toLamp);
+        float d = sqrt(d2);
+        float glintReach = cLampFalloff[i].w;
+        [branch] if (d < glintReach && d > 1e-3)
         {
             float3 L = toLamp / d;
             float3 a = cLampFalloff[i].xyz;
-            float falloff = rcp(max(a.x + a.y * d + a.z * d * d, 1)) *
-                            saturate((cutoff - d) / (kLampFadeShare * cutoff)) * saturate(L.z * 4);
-            float3 colour = cLampColour[i].rgb * falloff;
-            r.glint += colour * SunGlint(roughness, N, V, L);
-            r.diffuse += colour * saturate(dot(N, L) * 0.5 + 0.5);
+            float shape = cLampColour[i].w;
+            bool sized = shape > 0;                 // Living Azeroth's lights are a yard across
+            float de = sqrt(d2 + (sized ? 1 : 0));
+            float3 lamp = cLampColour[i].rgb * saturate(L.z * 4);
+            float t = saturate(d / cLampPosition[i].w);
+            float window = sized ? pow((1 - t * t) * (1 - t * t), shape) : saturate((1 - t) / kLampFadeShare);
+            r.diffuse += lamp * (rcp(max(a.x + a.y * de + a.z * de * de, 1)) * window * saturate(dot(N, L) * 0.5 + 0.5));
+            float m = de * kLampMirrorShrink;
+            float mirrored = rcp(max(a.x + a.y * m + a.z * m * m, 1)) *
+                             saturate((glintReach - d) / (kLampFadeShare * glintReach));
+            r.glint += lamp * (mirrored * SunGlint(max(roughness, cLampControl.w), N, V, L));
         }
     }
-    r.glint *= cLampControl.y;
+    r.glint *= cLampControl.z;
     r.diffuse *= cLampControl.y;
     return r;
+}
+
+// --- Sun glitter ---------------------------------------------------------------------------------------------------
+// The sun's highlight on rough water is many small facets each catching it for a moment, not one smooth patch. The
+// water is cut into cells, each holding a facet tilted at random (further with more wind, cGlitter.y) that lasts a
+// fraction of a second before the next takes its place; a facet that mirrors the sun to the eye sparkles as a dot in
+// its cell, fading in and out. The cells are never smaller than about kGlitterPixels pixels (two sizes, blended by the
+// pixel's footprint), so far off the sparkles grow rather than flicker. Strongest on the steeper water and where the
+// sun's own highlight is, never on foam, and only while the sun (or the moon) is up.
+static const float kGlitterSharpness = 500;   // the facet's lobe, exp((N.H - 1) x this): about 5 degrees across
+static const float kGlitterDot = 0.35;        // the dot's radius, of its cell
+static const float kGlitterRate = 3;          // facets a second in a cell (each cell between 0.6 and 1.4 times this)
+static const float kGlitterPixels = 2.5;      // a cell spans at least this many pixels
+static const float kGlitterGain = 40;         // x Fresnel: a sparkle head on is about as bright as the sun's colour
+
+float GlitterCells(float2 position, float cell, float3 N, float3 H)
+{
+    float2 q = position / cell;
+    float2 id = floor(q);
+    float3 pace = RainHash(id + 0.37);
+    // A whole number of facets per 256 s (the clock's wrap), and the facet's number taken over them, as the rain's
+    // rings do: no sparkle changes when the clock starts over.
+    float cycles = floor(256 * kGlitterRate * (0.6 + 0.8 * pace.z));
+    float life = cGlitter.z * (cycles / 256) + pace.x;
+    float n = floor(life);
+    n -= cycles * floor(n / cycles);
+    float3 facet = RainHash(id + n * float2(19.19, 7.73));
+    float3 Nm = normalize(N + float3((facet.xy - 0.5) * (2 * cGlitter.y), 0));
+    float lobe = exp((saturate(dot(Nm, H)) - 1) * kGlitterSharpness);
+    float2 spot = (frac(q) - lerp(kGlitterDot, 1 - kGlitterDot, facet.zx)) / kGlitterDot;
+    float age = frac(life);
+    return lobe * saturate(1 - dot(spot, spot)) * age * (1 - age) * 4;
+}
+
+float3 SunGlitter(WaterPixel w, float3 N, float3 V, float3 L, float crest, float foam)
+{
+    float strength = cGlitter.x * SunVisibility() * (1 - foam);
+    [branch] if (strength <= 0)
+        return 0;
+    float footprint = max(length(w.footprintX), length(w.footprintY));
+    float level = log2(max(footprint * kGlitterPixels / cGlitter.w, 1));
+    float fine = cGlitter.w * exp2(floor(level));
+    float3 H = normalize(V + L);
+    float sparkle = lerp(GlitterCells(w.position.xy, fine, N, H), GlitterCells(w.position.xy, 2 * fine, N, H),
+                         frac(level));
+    return SunColour() * (sparkle * strength * saturate(0.3 + 4 * crest) * kGlitterGain * FresnelSchlick(dot(V, H)));
 }
 
 float SunGlint(float roughness, float3 N, float3 V, float3 L)

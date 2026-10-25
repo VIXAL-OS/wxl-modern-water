@@ -81,6 +81,12 @@ struct Config
     float waterRainRipples = 0.6f;
     float waterRainSize = 1.8f;
     float waterRainDistance = 96.0f;
+    // Sparkles of the sun on the waves (vw_optics.hlsli SunGlitter).
+    float waterGlitter = 1.0f;
+    // Lamps, torches, lit windows and spell lights on the water: their light and their reflections (water_lamps.h).
+    float waterLamps = 1.0f;
+    // Reflections that stay put as the camera turns (vw_reflection.hlsli, steady steps).
+    bool waterSteadyReflections = true;
     bool waterClientSplashes = false;
     int waterDebugView = 0;
 };

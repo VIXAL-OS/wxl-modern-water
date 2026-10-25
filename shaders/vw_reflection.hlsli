@@ -19,7 +19,9 @@ float3 SkyColour(float elevation)
 
 #if SSR_STEPS > 0
 static const int kReflectionSteps = SSR_STEPS;
-static const int kReflectionRefinements = 3;
+// Halvings of the step where the ray passed behind the scene: 5 (was 3) pins a hit to a 32nd of a step, so its edges
+// don't jump by an eighth of one as the steps move.
+static const int kReflectionRefinements = 5;
 static const float kMinReflectionViewZ = 1e-3;
 static const float kMinInverseViewZ = 1e-8;
 static const float kMinScreenStep = 1e-6;
@@ -61,6 +63,9 @@ float2 RayUv(ReflectionRay ray, float s)
     return CopyUv(lerp(ray.startPixel, ray.vanishingPixel, s));
 }
 
+// How much of the ray (0 at its start, 1 at its vanishing point) is on the screen, up or down. Not cut at the screen's
+// sides: cut there, a ray leaving through a side took a high drake's raised wing tips drawn at that side into the water
+// (VisibilityRegression 1d). Past a side it reads the edge's column, as it always has.
 float OnScreenExtent(ReflectionRay ray)
 {
     float rise = ray.vanishingPixel.y - ray.startPixel.y;
@@ -68,6 +73,34 @@ float OnScreenExtent(ReflectionRay ray)
     float bottom = top + ViewportSize().y;
     float limit = rise < 0 ? (top - ray.startPixel.y) / rise : (bottom - ray.startPixel.y) / max(rise, kMinScreenStep);
     return saturate(limit);
+}
+
+// --- Steady steps ---------------------------------------------------------------------------------------------------
+// The trace's steps were spread evenly over the part of the ray on the screen, so they fell on other points of the ray
+// whenever the camera turned: a post or a lamp-post only a step tall was found from one view and stepped over from the
+// next, and the edges found moved by up to an eighth of a step, so reflections swam as the camera turned. Now the steps
+// sit at equal angles as seen from the camera, from the water to the ray's far end (the angle between the line of
+// sight and the reflected ray, which turning the camera doesn't change), never further apart than the screen's height
+// over the steps (cReflectionSteps.y): the same points of the ray, whichever way the camera looks. Only the screen's
+// edge cuts them short, and the last step is always there. A step at angle a from the water lies t = d0 sin a /
+// sin(A - a) along the ray (d0: the camera's distance to the water, A: the whole angle), which is s = Dz t / (z0 +
+// Dz t) of the way to the vanishing point on the screen (z0: the water's view depth, Dz: the ray's view-space rise):
+// with k = Dz d0 / z0, s = k sin a / (sin A cos a + (k - cos A) sin a). Kept in one register: sin A, k - cos A, k,
+// and the angle between steps (the plain shaders have no temp registers to spare).
+float4 MakeSteadySteps(WaterPixel w, float3 R, float dz)
+{
+    float cosSweep = dot(-w.toCamera, R);
+    float sweep = acos(clamp(cosSweep, -1, 1));
+    float k = dz * w.cameraDistance / w.waterZ;
+    return float4(sin(sweep), k - cosSweep, k, min(sweep, cReflectionSteps.y) / kReflectionSteps);
+}
+
+// Step `step`'s s (before the screen's edge cuts it short).
+float SteadyStep(float4 steady, int step)
+{
+    float2 a;
+    sincos(steady.w * step, a.y, a.x);
+    return steady.z * a.y / max(steady.x * a.x + steady.y * a.y, kMinScreenStep);
 }
 
 static const float kSeeThroughOutside = 1.25;      // x the reach squared: the camera at least this far from their middle
@@ -246,11 +279,14 @@ float4 TraceScreenReflection(WaterPixel w, float2 pixel, float3 R, out float2 hi
     float open = 0;   // the last step that wasn't the player
     bool afterPlayer = false;
     float lastZ = 0;  // the scene's depth at the last step (the screen's edge when nothing is hit)
+    float4 steady = MakeSteadySteps(w, R, viewDirection.z);
     [loop] for (int step = 1; step <= kReflectionSteps; ++step)
     {
-        [branch] if (behind == kNoReflectionHit)
+        [branch] if (behind == kNoReflectionHit && previous < extent)
         {
-            float s = extent * step / kReflectionSteps;
+            float even = extent * step / kReflectionSteps;
+            float s = step == kReflectionSteps ? extent
+                                               : min(lerp(even, SteadyStep(steady, step), cReflectionSteps.x), extent);
 #if PLAYER_MASK
             float2 texel = tex2Dlod(sSceneDepth, float4(RayUv(ray, s), 0, 0)).rg;
             float sceneZ = texel.r * cDepthDecode.r;
@@ -313,8 +349,18 @@ float4 TraceScreenReflection(WaterPixel w, float2 pixel, float3 R, out float2 hi
     }
     float2 uv = RayUv(ray, behind);
     hitUv = uv;
-    // Near the screen's top and bottom a hit fades into the sky -- except into scenery that covers it (OverheadCover).
+    // A hit close to where the ray leaves the screen fades into what a ray leaving there shows: the sky, unless the
+    // ray is already behind the scenery at the screen's edge (then neighbouring rays take that scenery, and so does
+    // this one) or rises to scenery overhead (OverheadCover). Faded by the hit's height on the screen alone, a reflection
+    // near the screen's top or bottom faded in and out as the camera tilted, wherever its ray went.
+    // (Steady reflections off: by the hit's height on the screen, as before.)
     float fade = saturate(1 - saturate((max(uv.y, 1 - uv.y) - kVerticalFadeStart) * kVerticalFadeRate));
+    [branch] if (cReflectionSteps.x > 0.5)
+    {
+        float leftOver = (extent - behind) * length(ray.vanishingPixel - ray.startPixel) / ViewportSize().y;
+        fade = extent < 1 ? saturate(leftOver * kVerticalFadeRate) : 1;
+        fade = max(fade, RayViewZ(ray, extent) >= CopiedViewDepth(sSceneDepth, RayUv(ray, extent)) ? 1 : 0);
+    }
     fade = max(fade, OverheadCover(lerp(rayFrom, rayTo, behind), CopiedViewDepth(sSceneDepth, uv)));
     return float4(GammaToLinear(tex2Dlod(sSceneColour, float4(uv, 0, 0)).rgb), fade);
 }
@@ -452,22 +498,23 @@ ReflectedPath SurfaceReflectionPath(WaterPixel w, float3 R, float2 hitUv, float 
     return path;
 }
 
-float3 FoggedSkyReflection(WaterPixel w, float3 R, float3 sky)
-{
-    [branch] if (!ReflectionFogActive())
-        return sky;
-    float4 fog = ReflectedPathFog(SkyReflectionPath(w, R));
-    return sky * fog.a + fog.rgb;
-}
-
-float3 FoggedScreenReflection(WaterPixel w, float3 R, float3 colour, float2 hitUv)
+// The fog along the reflected path, once for the reflection as blended (the sky's and the screen's): the path runs to
+// the sky's end, or to what the screen showed (by its share of the blend). Fogging the sky and the screen's colour each
+// on its own path was the same where either showed alone, but took the whole fog twice (about 560 of the shader's
+// instruction slots, which the steady steps, the lamps and the glitter now use).
+float3 FoggedReflection(WaterPixel w, float3 R, float3 colour, float screenShare, float2 hitUv)
 {
     [branch] if (!ReflectionFogActive())
         return colour;
-    float hitZ = CopiedViewDepth(sSceneDepth, hitUv);
     ReflectedPath path = SkyReflectionPath(w, R);
-    [flatten] if (hitZ < kSkyHitDepthFraction * MaxFogDistance())
-        path = SurfaceReflectionPath(w, R, hitUv, hitZ);
+    float hitZ = CopiedViewDepth(sSceneDepth, hitUv);
+    [branch] if (screenShare > 0 && hitZ < kSkyHitDepthFraction * MaxFogDistance())
+    {
+        ReflectedPath hit = SurfaceReflectionPath(w, R, hitUv, hitZ);
+        path.to = lerp(path.to, hit.to, screenShare);
+        path.heightPerYard = lerp(path.heightPerYard, hit.heightPerYard, screenShare);
+        path.skyRise *= 1 - screenShare;
+    }
     float4 fog = ReflectedPathFog(path);
     return colour * fog.a + fog.rgb;
 }
