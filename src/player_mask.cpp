@@ -49,7 +49,11 @@ using DrawBatchFn = void(__fastcall*)(void* ctx, void* edx);
 using DeviceDrawFn = void(__fastcall*)(void* device, void* edx, uint32_t* batch, int indexed);
 DrawBatchFn g_origBatch = nullptr;
 DeviceDrawFn g_origDraw = nullptr;
+// gxApi "D3D9Ex" draws through CGxDeviceD3d9Ex's own copy of the device draw (0x6A77C0, the core's Gx.DeviceDrawEx);
+// gxApi "D3D9" through CGxDeviceD3d's (0x6A3620, Gx.DeviceDraw). Both are hooked, the same work behind each.
+DeviceDrawFn g_origDrawEx = nullptr;
 bool g_hooked = false;
+bool g_hookedEx = false;
 
 void* g_playerRoot = nullptr; // this frame's root of the player's model family (compared, never read through)
 void* g_drawCtx = nullptr;    // the draw context of the player's batch drawing now (inside M2.DrawBatch)
@@ -196,6 +200,7 @@ bool EnsureMask(IDirect3DDevice9* dev, UINT width, UINT height)
 
 struct Redraw
 {
+    DeviceDrawFn original; // the device class's own draw (D3D9 or D3D9Ex)
     void* device;
     void* edx;
     uint32_t* batch;
@@ -205,7 +210,7 @@ struct Redraw
 void __cdecl DrawAgain(void* user)
 {
     const Redraw& r = *static_cast<const Redraw*>(user);
-    g_origDraw(r.device, r.edx, r.batch, r.indexed);
+    r.original(r.device, r.edx, r.batch, r.indexed);
 }
 
 void __fastcall hkBatch(void* ctx, void* edx)
@@ -220,9 +225,9 @@ void __fastcall hkBatch(void* ctx, void* edx)
     g_drawCtx = previous;
 }
 
-void __fastcall hkDraw(void* device, void* edx, uint32_t* batch, int indexed)
+void DrawThenMask(DeviceDrawFn original, void* device, void* edx, uint32_t* batch, int indexed)
 {
-    g_origDraw(device, edx, batch, indexed);
+    original(device, edx, batch, indexed);
     if (!g_drawCtx)
         return;
     const uintptr_t ctx = reinterpret_cast<uintptr_t>(g_drawCtx);
@@ -243,8 +248,18 @@ void __fastcall hkDraw(void* device, void* edx, uint32_t* batch, int indexed)
         dev = RealDevice(wrapper);
     if (!dev)
         return;
-    Redraw again{device, edx, batch, indexed};
+    Redraw again{original, device, edx, batch, indexed};
     Draw(dev, blend, &DrawAgain, &again);
+}
+
+void __fastcall hkDraw(void* device, void* edx, uint32_t* batch, int indexed)
+{
+    DrawThenMask(g_origDraw, device, edx, batch, indexed);
+}
+
+void __fastcall hkDrawEx(void* device, void* edx, uint32_t* batch, int indexed)
+{
+    DrawThenMask(g_origDrawEx, device, edx, batch, indexed);
 }
 }
 
@@ -263,6 +278,11 @@ bool Install(const WXL_Api* api)
     const bool draw =
         batch && attach("Gx.DeviceDraw", reinterpret_cast<void*>(&hkDraw), reinterpret_cast<void**>(&g_origDraw));
     g_hooked = batch && draw;
+    // The D3D9Ex device class's draw: a core without that point (before core d4e13b1) leaves gxApi "D3D9Ex" unmasked.
+    g_hookedEx = g_hooked &&
+                 attach("Gx.DeviceDrawEx", reinterpret_cast<void*>(&hkDrawEx), reinterpret_cast<void**>(&g_origDrawEx));
+    if (g_hooked && !g_hookedEx)
+        VF_LOG_INFO("player mask: no Gx.DeviceDrawEx hook point in this core; under gxApi D3D9Ex the mask stays empty");
     if (g_hooked)
         VF_LOG_INFO("player mask: hooks in; the reflections look past the player's own pixels");
     else
