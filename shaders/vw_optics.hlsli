@@ -170,6 +170,48 @@ LampLight LampsOnWater(WaterPixel w, float3 N, float3 V, float roughness)
     return r;
 }
 
+// --- Lightning on the water ----------------------------------------------------------------------------------------
+// A lightning strike (Living Azeroth's flash lights) is no lamp: it lights the clouds and the air, so the water flashes
+// all over, not in a streak. Within its reach (cFlashPosition.w, smoothly to nothing there) the sky the water mirrors
+// brightens in the strike's colour (sky, for the sky's share of the reflection), so does the water's surface (surface,
+// as a lamp's light: on the foam and in the water just under it), and the faces of the waves turned toward the strike
+// catch it in sharp lines along the crests (glint). Each frame at the strike's own brightness: it fades as it does.
+static const float kFlashSky = 1.0;          // of the strike's light the mirrored sky gains
+static const float kFlashSurface = 0.5;      // of it falling on the surface
+static const float kFlashCrest = 0.35;       // of it on a crest face turned toward it
+static const float kFlashCrestStart = 0.06;  // how far a face leans toward the strike (sine of its tilt) to start...
+static const float kFlashCrestFull = 0.22;   // ...and to catch it fully
+
+struct FlashLight
+{
+    float3 sky;
+    float3 surface;
+    float3 glint;
+};
+
+FlashLight FlashesOnWater(WaterPixel w, float3 N)
+{
+    FlashLight f = (FlashLight)0;
+    int count = (int)cFlashControl.x;
+    [loop] for (int i = 0; i < kMaxFlashes; ++i)
+    {
+        [branch] if (i >= count)
+            break;
+        float3 toStrike = cFlashPosition[i].xyz - w.position;
+        float t = saturate(length(toStrike) / cFlashPosition[i].w);
+        float3 light = cFlashColour[i].rgb * ((1 - t * t) * (1 - t * t));
+        float2 across = normalize(toStrike.xy + float2(1e-4, 0));
+        f.sky += light;
+        f.surface += light * saturate(dot(N, normalize(toStrike)) * 0.5 + 0.5);
+        f.glint += light * smoothstep(kFlashCrestStart, kFlashCrestFull, dot(N.xy, across));
+    }
+    float strength = cFlashControl.y;
+    f.sky *= kFlashSky * strength;
+    f.surface *= kFlashSurface * strength;
+    f.glint *= kFlashCrest * strength;
+    return f;
+}
+
 // --- Sun glitter ---------------------------------------------------------------------------------------------------
 // The sun's highlight on rough water is many small facets each catching it for a moment, not one smooth patch. The
 // water is cut into cells, each holding a facet tilted at random (further with more wind, cGlitter.y) that lasts a

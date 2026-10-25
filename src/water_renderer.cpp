@@ -25,7 +25,7 @@
 
 namespace
 {
-constexpr UINT kWaterPixelConstants = 156;
+constexpr UINT kWaterPixelConstants = 161;
 constexpr DWORD kWaterSamplerStages = 16;
 constexpr UINT kCommonConstants = 9;
 constexpr UINT kShadingFirstConstant = 9;
@@ -1597,6 +1597,17 @@ void WaterRenderer::FillClassConstants(ShadingConstants& c, const WaterPreset& p
         c.lampPosition[i] = on ? Float4{lamp.position[0], lamp.position[1], lamp.position[2], lamp.reach} : Float4{};
         c.lampColour[i] = on ? Float4{lamp.colour[0], lamp.colour[1], lamp.colour[2], lamp.shape} : Float4{};
         c.lampFalloff[i] = on ? Float4{lamp.falloff[0], lamp.falloff[1], lamp.falloff[2], lamp.mirrorReach} : Float4{};
+    }
+    // Lightning strikes flash over the water (vw_optics.hlsli FlashesOnWater), at their own brightness this frame; they
+    // take no lamp's place.
+    const uint32_t flashes = lampStrength > 0.0f ? std::min(m_lamps.flashes, kMaxWaterFlashes) : 0u;
+    c.flashControl = {static_cast<float>(flashes), lampStrength, 0.0f, 0.0f};
+    for (uint32_t i = 0; i < kMaxWaterFlashes; ++i)
+    {
+        const WaterFlash& flash = m_lamps.flash[i];
+        const bool on = i < flashes;
+        c.flashPosition[i] = on ? Float4{flash.position[0], flash.position[1], flash.position[2], flash.reach} : Float4{};
+        c.flashColour[i] = on ? Float4{flash.colour[0], flash.colour[1], flash.colour[2], 0.0f} : Float4{};
     }
     // Sun glitter: the facets tilt further with more wind; none on flat water, less in the rain (its rings break the
     // surface and the sun is behind clouds).

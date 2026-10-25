@@ -84,7 +84,8 @@ float4 main(float2 pixelIndex : VPOS) : COLOR0
     float4 screenReflection = TraceScreenReflection(w, pixel, R, hitUv);
     float3 reflected = FoggedReflection(w, R, lerp(SkyColour(R.z), screenReflection.rgb, screenReflection.a),
                                         screenReflection.a, hitUv);
-    float3 environment = reflected * EnvironmentBrdf(envRoughness, NoV) * ReflectionStrength();
+    float mirrored = EnvironmentBrdf(envRoughness, NoV) * ReflectionStrength();
+    float3 environment = reflected * mirrored;
     float3 H = normalize(V + L);
     float environmentAttenuation = 1 - FresnelSchlick(dot(H, V)) * SunVisibility();
     float3 sunSpecular = SunVisibility() * SunColour() * SpecularStrength() * SunGlint(sunRoughness, N, V, L);
@@ -93,6 +94,12 @@ float4 main(float2 pixelIndex : VPOS) : COLOR0
     LampLight lamps = LampsOnWater(w, N, V, sunRoughness);
     float3 underSurface = (1 - transmittance) * kLampScatter * lerp(TroughScatteringColour(), CrestScatteringColour(), kCrestColourBlend);
     colour += lamps.glint * SpecularStrength() + lamps.diffuse * lerp(underSurface, foamAlbedo.rgb, foamAlbedo.a);
+    // Lightning: the mirrored sky flashes (where the water shows the sky, its own or the sky drawn on the screen, not
+    // the scenery: that is lit by the strike already), the surface and the crests.
+    FlashLight flash = FlashesOnWater(w, N);
+    float sceneryShare = CopiedViewDepth(sSceneDepth, hitUv) < kSkyHitDepthFraction * MaxFogDistance() ? screenReflection.a : 0;
+    colour += flash.sky * (mirrored * (1 - sceneryShare)) + flash.glint +
+              flash.surface * lerp(underSurface, foamAlbedo.rgb, foamAlbedo.a);
 
     // Normal-only rings disappear under uniform overcast reflections. A small
     // lit splash crest makes the expanding wave readable in that lighting too.

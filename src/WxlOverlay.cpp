@@ -98,8 +98,8 @@ static void __cdecl DrawPanel(void*)
         else if (lamps.source == WaterLampSource::None)
             std::snprintf(line, sizeof(line), "Lamps on the water: none near");
         else
-            std::snprintf(line, sizeof(line), "Lamps on the water: %u of %u from %s", lamps.count, lamps.offered,
-                          WaterLampSourceName(lamps.source));
+            std::snprintf(line, sizeof(line), "Lamps on the water: %u of %u from %s%s", lamps.count, lamps.offered,
+                          WaterLampSourceName(lamps.source), lamps.flashes ? ", lightning flashing" : "");
         api.UiText(line);
         p.Float("Clarity", edited.waterClarity, 0.25f, 4.0f);
         p.Float("Zone colours", edited.waterZoneColors, 0.0f, 1.0f);

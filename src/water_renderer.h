@@ -157,6 +157,9 @@ private:
         Float4 floorWide2;                               // c153
         Float4 glitter;                                  // c154: strength, facet tilt, seconds mod 256, finest cell
         Float4 reflectionSteps;                          // c155: steady (1/0), the screen's height as an angle
+        Float4 flashControl;                             // c156: lightning strikes: count, strength
+        Float4 flashPosition[kMaxWaterFlashes];          // c157: world position, reach of the flash
+        Float4 flashColour[kMaxWaterFlashes];            // c159: colour (linear), this frame's
     };
 
     struct FoamMaskTexture

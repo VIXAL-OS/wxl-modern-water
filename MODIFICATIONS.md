@@ -35,7 +35,8 @@ manatactical, licensed under GPL-3.0 (see [LICENSE](LICENSE)). The modifications
   - Lamps on the water: their light, and their reflections as streaks running toward you, broken up by the waves.
     The lights come from Seyris Living Azeroth's light list (`chromie.light-list` v1: lamps, torches, lit windows,
     spell lights) when it publishes one, else from the client's own point lights, which the water now reads in game
-    (before, only the offline tests handed it any).
+    (before, only the offline tests handed it any). Its lightning strikes flash over the water instead: the mirrored
+    sky, the surface and the wave crests turned toward the strike brighten in its colour as it fades, with no streak.
   - Refraction without moiré.
   - No shadow stripes on walls the light skims.
   - Sun glint, and sun glitter: sparkles where the waves catch the sun for a moment, wider with more wind.

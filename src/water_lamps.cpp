@@ -25,6 +25,8 @@ constexpr float kBehindShare = 0.3f;
 constexpr float kBehindCosine = -0.2f;
 constexpr float kMinLampShape = 0.25f;
 constexpr float kLivingAzerothFalloff[3] = {0.0f, 0.7f, 0.03f}; // LightList.hpp
+// A lightning strike lights the water half as far again as its light's radius (Living Azeroth's strikes: 60 yd -> 90).
+constexpr float kFlashReachPerRadius = 1.5f;
 
 WaterLampsStatus g_last;
 
@@ -76,6 +78,20 @@ void FromLivingAzeroth(const WxlLightV1* lights, uint32_t count, uint32_t stride
     };
     Ranked best[kMaxWaterLamps] = {};
     uint32_t kept = 0;
+    Ranked strikes[kMaxWaterFlashes] = {};
+    uint32_t struck = 0;
+    // Keeps the `capacity` highest scores in `ranked`, highest first.
+    auto rank = [](Ranked* ranked, uint32_t& held, uint32_t capacity, float score, const WxlLightV1* light) {
+        uint32_t at = held;
+        while (at > 0 && ranked[at - 1].score < score)
+            --at;
+        if (at >= capacity)
+            return;
+        for (uint32_t k = std::min(held, capacity - 1); k > at; --k)
+            ranked[k] = ranked[k - 1];
+        ranked[at] = {score, light};
+        held = std::min(held + 1, capacity);
+    };
     const auto* bytes = reinterpret_cast<const unsigned char*>(lights);
     for (uint32_t i = 0; i < count; ++i)
     {
@@ -89,20 +105,20 @@ void FromLivingAzeroth(const WxlLightV1* lights, uint32_t count, uint32_t stride
         const float to[3] = {light->position[0] - in.camPos[0], light->position[1] - in.camPos[1],
                              light->position[2] - in.camPos[2]};
         const float d = std::sqrt(to[0] * to[0] + to[1] * to[1] + to[2] * to[2]);
+        // A lightning strike: whatever water its flash reaches near the camera, the brightest (by its reach) first.
+        if (light->flags & kWxlLightFlash)
+        {
+            const float reach = light->radius * kFlashReachPerRadius;
+            if (d <= reach + kMaxLampDistance)
+                rank(strikes, struck, kMaxWaterFlashes, Peak(light->colour) * reach / (reach + d), light);
+            continue;
+        }
         if (!(d <= kMaxLampDistance))
             continue;
         const float facing = d > 1e-3f ? (to[0] * forward[0] + to[1] * forward[1] + to[2] * forward[2]) / d : 1.0f;
         const float ranked = d / kLampRanking;
-        const float score = Peak(light->colour) * (facing >= kBehindCosine ? 1.0f : kBehindShare) / (1.0f + ranked * ranked);
-        uint32_t at = kept;
-        while (at > 0 && best[at - 1].score < score)
-            --at;
-        if (at >= kMaxWaterLamps)
-            continue;
-        for (uint32_t k = std::min(kept, kMaxWaterLamps - 1); k > at; --k)
-            best[k] = best[k - 1];
-        best[at] = {score, light};
-        kept = std::min(kept + 1, kMaxWaterLamps);
+        rank(best, kept, kMaxWaterLamps,
+             Peak(light->colour) * (facing >= kBehindCosine ? 1.0f : kBehindShare) / (1.0f + ranked * ranked), light);
     }
     const PointLightUpload upload{true, 1.0f};
     for (uint32_t k = 0; k < kept; ++k)
@@ -115,6 +131,14 @@ void FromLivingAzeroth(const WxlLightV1* lights, uint32_t count, uint32_t stride
         lamp.shape = std::max(std::isfinite(light.falloff) ? light.falloff : 1.0f, kMinLampShape);
         std::memcpy(lamp.falloff, kLivingAzerothFalloff, sizeof(lamp.falloff));
         lamp.mirrorReach = std::min(light.radius * kMirrorPerReach, std::max(kMaxMirrorReach, light.radius));
+    }
+    for (uint32_t k = 0; k < struck; ++k)
+    {
+        const WxlLightV1& light = *strikes[k].light;
+        WaterFlash& flash = out.flash[out.flashes++];
+        std::memcpy(flash.position, light.position, sizeof(flash.position));
+        flash.reach = light.radius * kFlashReachPerRadius;
+        engine::UploadedPointLightColor(light.colour, upload, flash.colour);
     }
     out.offered = count;
     out.source = WaterLampSource::LivingAzeroth;
@@ -131,7 +155,7 @@ void ChooseWaterLamps(const FrameInputs& in, WaterLamps& out)
         FromLivingAzeroth(lights, listed, stride, in, out);
     else
         FromClient(in.localLights, out);
-    g_last = {out.count, out.offered, out.source};
+    g_last = {out.count, out.offered, out.source, out.flashes};
 }
 
 const char* WaterLampSourceName(WaterLampSource source)

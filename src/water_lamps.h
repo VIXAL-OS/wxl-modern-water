@@ -9,7 +9,10 @@
 // lights, all of them near the player), else the client's own point lights (engine_lights.h: the eight that light the
 // camera's surroundings most, only those of models in view). Never both: Living Azeroth's list holds the client's
 // lights already, merged its way.
-constexpr uint32_t kMaxWaterLamps = 8; // vw_constants.hlsli kMaxLamps
+constexpr uint32_t kMaxWaterLamps = 8;   // vw_constants.hlsli kMaxLamps
+// Lightning strikes (the list's flash lights, kWxlLightFlash) are no lamps: they flash over the water (vw_optics.hlsli
+// FlashesOnWater) and don't take a lamp's place.
+constexpr uint32_t kMaxWaterFlashes = 2; // vw_constants.hlsli kMaxFlashes
 
 enum class WaterLampSource : uint32_t
 {
@@ -28,10 +31,19 @@ struct WaterLamp
     float mirrorReach;  // yd: its reflection ends here
 };
 
+struct WaterFlash
+{
+    float position[3];
+    float reach;        // yd: the flash ends here (the light's radius x water_lamps.cpp kFlashReachPerRadius)
+    float colour[3];    // linear, this frame's (the strike fades on its own)
+};
+
 struct WaterLamps
 {
     WaterLamp lamp[kMaxWaterLamps] = {};
     uint32_t count = 0;
+    WaterFlash flash[kMaxWaterFlashes] = {};
+    uint32_t flashes = 0;
     uint32_t offered = 0; // the lights its source had this frame
     WaterLampSource source = WaterLampSource::None;
 };
@@ -46,5 +58,6 @@ struct WaterLampsStatus
     uint32_t count = 0;
     uint32_t offered = 0;
     WaterLampSource source = WaterLampSource::None;
+    uint32_t flashes = 0;
 };
 WaterLampsStatus LastWaterLampsStatus();

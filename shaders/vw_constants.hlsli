@@ -67,6 +67,12 @@ float4 cGlitter : register(c154);
 // The reflections' trace (vw_reflection.hlsli): 1 = steady steps (fixed angles as seen from the camera, so a reflection
 // stays put as the camera turns), 0 = spread over the screen as before; the screen's height as an angle (radians).
 float4 cReflectionSteps : register(c155);
+// Lightning strikes near the camera (water_lamps.h: Living Azeroth's flash lights): count, strength; per strike its
+// world position and how far its flash reaches (yd), and its colour (linear, this frame's).
+static const int kMaxFlashes = 2;
+float4 cFlashControl : register(c156);
+float4 cFlashPosition[kMaxFlashes] : register(c157);
+float4 cFlashColour[kMaxFlashes] : register(c159);
 
 sampler2D sSceneColour : register(s0);
 sampler2D sSceneDepth : register(s1);
